@@ -39,8 +39,29 @@ jobs:
 
       - name: Cross-compile
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/fxpool-proxy-linux-amd64 ./cmd/fxpool-proxy
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o /tmp/fxpool-proxy-linux-arm64 ./cmd/fxpool-proxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o /tmp/fxpool-proxy-linux-amd64 ./cmd/fxpool-proxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -o /tmp/fxpool-proxy-linux-arm64 ./cmd/fxpool-proxy
 
       - name: Shell syntax
         run: bash -n install.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build amd64 image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: fxpool-proxy:ci
+          build-args: VERSION=dev
+
+      - name: Version smoke test
+        run: test "$(docker run --rm fxpool-proxy:ci version)" = "dev"

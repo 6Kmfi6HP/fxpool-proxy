@@ -28,7 +28,8 @@ import (
 	"fxpool-proxy/internal/upstream"
 )
 
-const version = "0.1.0-go"
+// version is replaced from the release tag at build time with -ldflags.
+var version = "dev"
 
 type config struct {
 	root, guardian, serverURL, proxyPass, fxaToken, bind, advertise, rotator, httpRotator, rotateMode, countries, country, authUser, authPass, firefoxVersion, clientCountry string

@@ -72,7 +72,7 @@ ensure_binary() {
     if [[ ! -x "$binary" ]]; then
       info "building $BINARY_NAME"
       command -v go >/dev/null 2>&1 || die "go not found; install Go 1.24+ or set FXPOOL_BINARY"
-      (cd "$SCRIPT_DIR" && go build -trimpath -o "$binary" "./cmd/$BINARY_NAME")
+      (cd "$SCRIPT_DIR" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$binary" "./cmd/$BINARY_NAME")
       chmod 755 "$binary"
     fi
     [[ -x "$binary" ]] || die "binary is not executable: $binary"

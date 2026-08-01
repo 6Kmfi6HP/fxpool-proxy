@@ -1,10 +1,41 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestVersion(t *testing.T) {
+	want := "v9.8.7-test"
+	oldVersion := version
+	oldStdout := os.Stdout
+	version = want
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() {
+		version = oldVersion
+		os.Stdout = oldStdout
+	})
+
+	if got := run([]string{"version"}); got != 0 {
+		t.Fatalf("exit %d", got)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(r); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != want+"\n" {
+		t.Fatalf("version output %q, want %q", got, want+"\n")
+	}
+}
 
 func TestRunValidationBeforeIO(t *testing.T) {
 	for _, args := range [][]string{{"run", "--limit=-1"}, {"run", "--no-socks", "--no-http"}, {"run", "--countries=US", "--recommended"}, {"run", "--bind=0.0.0.0"}} {

@@ -1,6 +1,8 @@
 .PHONY: build test race vet fmt-check cross
+VERSION ?= dev
+LDFLAGS := -s -w -X main.version=$(VERSION)
 build:
-	go build -trimpath -o fxpool-proxy ./cmd/fxpool-proxy
+	CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o fxpool-proxy ./cmd/fxpool-proxy
 test:
 	go test ./...
 race:
@@ -10,5 +12,5 @@ vet:
 fmt-check:
 	@test -z "$$(gofmt -l cmd internal)"
 cross:
-	GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/fxpool-proxy-linux-amd64 ./cmd/fxpool-proxy
-	GOOS=linux GOARCH=arm64 go build -trimpath -o /tmp/fxpool-proxy-linux-arm64 ./cmd/fxpool-proxy
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o /tmp/fxpool-proxy-linux-amd64 ./cmd/fxpool-proxy
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o /tmp/fxpool-proxy-linux-arm64 ./cmd/fxpool-proxy

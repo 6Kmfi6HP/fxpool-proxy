@@ -7,7 +7,44 @@
 不支持 MASQUE / HTTP3 / QUIC / UDP；未知上游协议、未知过滤表达式、未鉴权的
 非回环监听均会 fail closed。与 Mozilla / Firefox / Fastly 无官方隶属关系。
 
-要求 Go 1.24+（一键安装会自动 `go build`）。Linux 建议配合 systemd。
+要求 Go 1.25+（一键安装会自动 `go build`）。Linux 建议配合 systemd。
+
+## 下载发布版本
+
+从 [GitHub Releases](https://github.com/6Kmfi6HP/fxpool-proxy/releases) 下载与系统、
+架构匹配的压缩包。每个包包含二进制、README 和 LICENSE；Linux 包还包含
+`install.sh`。校验下载文件（示例使用 GNU `sha256sum`）：
+
+```bash
+sha256sum -c checksums.txt --ignore-missing
+./fxpool-proxy version
+```
+
+也可用 GitHub CLI 验证构建来源证明：
+
+```bash
+gh attestation verify fxpool-proxy_v0.1.0_linux_amd64.tar.gz \
+  --repo 6Kmfi6HP/fxpool-proxy
+```
+
+## Docker
+
+镜像发布到 `ghcr.io/6kmfi6hp/fxpool-proxy`，支持 Linux amd64/arm64。容器以
+非 root 用户运行，运行数据保存在 `/var/lib/fxpool`。容器默认监听所有接口，
+因此必须提供成对的本地代理用户名和密码，否则安全检查会拒绝启动：
+
+```bash
+docker run -d --name fxpool-proxy \
+  -p 1090:1090 -p 8080:8080 \
+  -e FXPOOL_LISTEN_USER=fxpool \
+  -e FXPOOL_LISTEN_PASS='replace-with-a-strong-password' \
+  -v fxpool-data:/var/lib/fxpool \
+  ghcr.io/6kmfi6hp/fxpool-proxy:0.1.0
+```
+
+需要从主机导入续期凭据时，优先将凭据复制进持久卷并保持 `0600` 权限；不要
+把凭据构建进镜像或提交到仓库。稳定版同时发布完整版本、minor、major、
+`latest` 和 `sha-<commit>` 标签；预发布版只发布完整版本与提交 SHA 标签。
 
 ## 一键安装
 
@@ -64,7 +101,7 @@ FXPOOL_LISTEN_PASS=change-me
 ## 手动构建
 
 ```bash
-go build -trimpath -o fxpool-proxy ./cmd/fxpool-proxy
+CGO_ENABLED=0 go build -trimpath -buildvcs=false -o fxpool-proxy ./cmd/fxpool-proxy
 make cross   # /tmp/fxpool-proxy-linux-{amd64,arm64}
 ```
 
@@ -212,7 +249,20 @@ bash -n install.sh
 ```
 
 GitHub Actions（`.github/workflows/ci.yml`）：gofmt、test、race、vet、govulncheck、
-Linux amd64/arm64 交叉编译、`install.sh` 语法检查。
+Linux amd64/arm64 交叉编译、`install.sh` 语法检查，以及 Docker amd64 构建和
+版本冒烟测试。
+
+维护者发布稳定版本时，先确认 `main` 的普通 CI 全部通过，再创建 annotated
+SemVer 标签；标签提交必须属于 `main`：
+
+```bash
+git tag -a v0.1.0 -m "Release v0.1.0"
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` 会重新执行发布校验，构建六个平台包与多架构
+GHCR 镜像，生成校验和、GitHub Release 和构建来源证明。发布失败时修复后使用
+新的补丁版本，不移动或覆盖已发布标签。
 
 ## 文档
 

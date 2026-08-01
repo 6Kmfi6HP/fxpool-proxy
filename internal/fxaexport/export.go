@@ -399,11 +399,10 @@ func scanProfilesDir(root string) []Profile {
 }
 
 func readBounded(path string, limit int64) ([]byte, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	f, err := openReadNoFollow(path)
 	if err != nil {
 		return nil, err
 	}
-	f := os.NewFile(uintptr(fd), path)
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {

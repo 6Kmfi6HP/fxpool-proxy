@@ -1,0 +1,16 @@
+.git
+.github
+.gitignore
+Dockerfile*
+docs
+tokens
+data
+export
+logs
+*.env
+*.jwt
+*.jsonl
+*.log
+fxpool-proxy
+fxpool-proxy_*
+fxa-renewal-credentials.json

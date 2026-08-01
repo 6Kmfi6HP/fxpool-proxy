@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"fxpool-proxy/internal/securefile"
@@ -243,17 +242,13 @@ func (m *Manager) lock(block bool) (*os.File, error) {
 	if e != nil {
 		return nil, e
 	}
-	how := syscall.LOCK_EX
-	if !block {
-		how |= syscall.LOCK_NB
-	}
-	if e = syscall.Flock(int(f.Fd()), how); e != nil {
+	if e = lockFile(f, block); e != nil {
 		f.Close()
 		return nil, errors.New("another refresh is in progress")
 	}
 	return f, nil
 }
-func unlock(f *os.File) { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }
+func unlock(f *os.File) { _ = unlockFile(f); _ = f.Close() }
 
 type httpError struct {
 	status int
