@@ -214,6 +214,18 @@ bash -n install.sh
 GitHub Actions（`.github/workflows/ci.yml`）：gofmt、test、race、vet、govulncheck、
 Linux amd64/arm64 交叉编译、`install.sh` 语法检查。
 
+## 文档
+
+逆向结论、上游兼容与凭据指南（已脱敏）见 [`docs/`](docs/README.md)：
+
+| 分类 | 说明 |
+|------|------|
+| [docs/research/](docs/research/) | 架构、协议、源码实证 findings |
+| [docs/notes/](docs/notes/) | 路线图、观测面、验证日志 |
+| [docs/compatibility/](docs/compatibility/) | Remote Settings / Guardian 适配 |
+| [docs/guides/](docs/guides/) | 从本机 Firefox 导出续期凭据 |
+| [docs/SECURITY.md](docs/SECURITY.md) | 漏洞报告与凭据边界 |
+
 ## 法律
 
 仅使用你本人有权使用的账号、网络与服务，并遵守适用条款与法律。
