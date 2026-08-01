@@ -194,6 +194,9 @@ jobs:
     needs: [binaries, docker]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout tag
+        uses: actions/checkout@v6
+
       - name: Download packages
         uses: actions/download-artifact@v6
         with:
