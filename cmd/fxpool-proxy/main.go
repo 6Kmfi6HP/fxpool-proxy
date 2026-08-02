@@ -20,21 +20,25 @@ import (
 	"syscall"
 	"time"
 
+	"fxpool-proxy/internal/fxa"
 	"fxpool-proxy/internal/fxaexport"
 	"fxpool-proxy/internal/pool"
 	"fxpool-proxy/internal/securefile"
 	"fxpool-proxy/internal/serverlist"
 	"fxpool-proxy/internal/token"
 	"fxpool-proxy/internal/upstream"
+
+	"golang.org/x/term"
 )
 
 // version is replaced from the release tag at build time with -ldflags.
 var version = "dev"
 
 type config struct {
-	root, guardian, serverURL, proxyPass, fxaToken, bind, advertise, rotator, httpRotator, rotateMode, countries, country, authUser, authPass, firefoxVersion, clientCountry string
-	socksBase, httpBase, limit                                                                                                                                               int
-	forceSync, allowNoToken, noSocks, noHTTP, requireAuth, allowOpen, includeLocked, recommended                                                                             bool
+	root, guardian, serverURL, proxyPass, fxaToken, bind, advertise, rotator, httpRotator, rotateMode, countries, country, authUser, authPass, firefoxVersion, clientCountry, masqueURI string
+	fxaBase                                                                                                                                                                             string
+	socksBase, httpBase, udpBase, limit                                                                                                                                                 int
+	forceSync, allowNoToken, noSocks, noHTTP, requireAuth, allowOpen, includeLocked, recommended                                                                                        bool
 }
 
 type endpoint struct {
@@ -60,12 +64,14 @@ func flagsFor(name string) (*flag.FlagSet, *config) {
 	f.StringVar(&c.root, "root", wd, "project runtime root")
 	f.StringVar(&c.guardian, "guardian", env("GUARDIAN", "https://vpn.mozilla.org"), "Guardian base URL")
 	f.StringVar(&c.serverURL, "serverlist-url", serverlist.DefaultURL, "Remote Settings URL")
+	f.StringVar(&c.fxaBase, "fxa-base", "", "FxA auth-server base URL (default https://api.accounts.firefox.com/v1)")
 	f.StringVar(&c.proxyPass, "proxy-pass-jwt", env("PROXY_PASS_JWT", ""), "explicit ProxyPass JWT")
 	f.StringVar(&c.fxaToken, "fxa-token", env("FXA_TOKEN", ""), "temporary FxA OAuth access token")
 	f.StringVar(&c.bind, "bind", env("BIND", "127.0.0.1"), "listen address")
 	f.StringVar(&c.advertise, "advertise-host", env("ADVERTISE_HOST", ""), "exported host")
 	f.IntVar(&c.socksBase, "socks-base", 21000, "first per-node SOCKS port")
 	f.IntVar(&c.httpBase, "http-base", 31000, "first per-node HTTP port")
+	f.IntVar(&c.udpBase, "udp-base", 41000, "first per-node UDP relay port (SOCKS5 UDP ASSOCIATE via MASQUE)")
 	f.IntVar(&c.limit, "limit", 0, "maximum node count")
 	f.StringVar(&c.countries, "countries", env("COUNTRIES", ""), "comma-separated countries")
 	f.BoolVar(&c.noSocks, "no-socks", false, "disable SOCKS listeners")
@@ -82,6 +88,7 @@ func flagsFor(name string) (*flag.FlagSet, *config) {
 	f.BoolVar(&c.allowOpen, "allow-open-proxy", false, "permit an unauthenticated non-loopback listener")
 	f.StringVar(&c.firefoxVersion, "firefox-version", env("FIREFOX_VERSION", serverlist.DefaultFirefoxVersion), "Firefox version")
 	f.StringVar(&c.clientCountry, "client-country", env("CLIENT_COUNTRY", ""), "client country for filters")
+	f.StringVar(&c.masqueURI, "masque-uri", env("MASQUE_URI", ""), "MASQUE proxy URI template, e.g. https://host:443/.well-known/masque/udp/{target_host}/{target_port}/")
 	f.BoolVar(&c.includeLocked, "include-locked", false, "include locked records diagnostically")
 	f.BoolVar(&c.recommended, "recommended", false, "use REC records only")
 	return f, c
@@ -89,18 +96,24 @@ func flagsFor(name string) (*flag.FlagSet, *config) {
 func main() { os.Exit(run(os.Args[1:])) }
 func run(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: fxpool-proxy <sync|token-status|token-refresh|usage|how-to-token|probe|run|export-credentials|import-credentials>")
+		fmt.Fprintln(os.Stderr, "usage: fxpool-proxy <sync|token-status|token-refresh|usage|how-to-token|probe|run|login|export-credentials|import-credentials>")
 		return 2
 	}
 	cmd := argv[0]
 	f, c := flagsFor(cmd)
 	force := false
 	deleteSource, noVerify := false, false
+	loginEmail, loginTOTP := "", ""
 	bundle := ""
 	exportOut, exportProfile, exportFirefoxDir := "fxa-renewal-credentials.json", "", ""
 	exportList, exportImport, exportStdout := false, false, false
 	if cmd == "token-refresh" {
 		f.BoolVar(&force, "force", false, "force refresh")
+	}
+	if cmd == "login" {
+		f.StringVar(&loginEmail, "email", "", "Firefox Account email")
+		f.BoolVar(&noVerify, "no-verify", false, "publish without Guardian refresh")
+		f.StringVar(&loginTOTP, "totp", "", "two-factor code (skip interactive prompt)")
 	}
 	if cmd == "import-credentials" {
 		f.BoolVar(&deleteSource, "delete-source", false, "delete bundle after verification")
@@ -144,6 +157,8 @@ func run(argv []string) int {
 		return 0
 	case "probe":
 		return cmdProbe(c)
+	case "login":
+		return cmdLogin(c, loginEmail, noVerify, loginTOTP)
 	case "run":
 		return cmdRun(c)
 	case "export-credentials":
@@ -166,6 +181,9 @@ func run(argv []string) int {
 }
 func manager(c *config) *token.Manager {
 	m := token.NewManager(c.root, c.guardian)
+	if c.fxaBase != "" {
+		m.FxAAuth = strings.TrimRight(c.fxaBase, "/")
+	}
 	m.ExplicitProxyPass = strings.TrimSpace(c.proxyPass)
 	m.AccessToken = strings.TrimSpace(c.fxaToken)
 	return m
@@ -236,8 +254,76 @@ func cmdUsage(c *config) int {
 	printJSON(u)
 	return 0
 }
+
+// cmdLogin authenticates with an FxA email+password, publishes the renewal
+// credentials, and (unless --no-verify) refreshes a ProxyPass to verify the
+// whole chain. The password is read without echo and never retained.
+func cmdLogin(c *config, email string, noVerify bool, totp string) int {
+	if email == "" {
+		fmt.Print("Firefox Account email: ")
+		email = strings.TrimSpace(readLine())
+	}
+	email = strings.TrimSpace(email)
+	if !strings.Contains(email, "@") {
+		safeError(errors.New("a valid Firefox Account email is required"))
+		return 2
+	}
+	fmt.Print("Firefox Account password: ")
+	password, e := readPassword()
+	fmt.Fprintln(os.Stderr)
+	if e != nil {
+		safeError(e)
+		return 1
+	}
+	if password == "" {
+		safeError(errors.New("password must not be empty"))
+		return 2
+	}
+	ctx := context.Background()
+	m := manager(c)
+	opts := []func(*fxa.Client){}
+	if c.fxaBase != "" {
+		opts = append(opts, func(fc *fxa.Client) { fc.Base = c.fxaBase })
+	}
+	if totp != "" {
+		opts = append(opts, func(fc *fxa.Client) {
+			fc.TOTPPrompt = func() (string, error) { return totp, nil }
+		})
+	}
+	sess, e := m.Login(ctx, email, password, opts...)
+	if e != nil {
+		safeError(e)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "[+] authenticated uid=%s\n", sess.UID)
+	if !noVerify {
+		if _, e = m.Refresh(ctx, true); e != nil {
+			safeError(errors.New("logged in but ProxyPass refresh failed; credentials published"))
+			return 1
+		}
+		fmt.Println("[+] logged in; renewal credentials published and ProxyPass refreshed")
+		return 0
+	}
+	fmt.Println("[+] logged in; renewal credentials published (not verified)")
+	return 0
+}
+
+func readLine() string {
+	b, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	return b
+}
+
+func readPassword() (string, error) {
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		b, e := term.ReadPassword(fd)
+		return string(b), e
+	}
+	b, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	return strings.TrimSuffix(b, "\n"), nil
+}
 func guide() {
-	fmt.Print("Firefox 桌面凭据导出/导入\n\n1. 在本机 Firefox 登录 Firefox Account，启用 IP Protection，并完成设备注册。\n2. 在本机运行：fxpool-proxy export-credentials\n   程序会自动读取配置目录中的 signedInUser.json，写出最小续期凭据包。\n3. 同机可直接：fxpool-proxy export-credentials --import\n   或把凭据包拷到 VPS 后：fxpool-proxy import-credentials /path/to/file --delete-source\n4. 用 fxpool-proxy token-status 检查续期状态。\n\n完整步骤见 README.md；凭据包等同登录会话，不要分享。\n")
+	fmt.Print("Firefox 凭据获取（二选一）\n\n方式一：邮箱+密码自动登录（推荐，无需本机 Firefox）\n  运行：fxpool-proxy login\n  按提示输入 FxA 邮箱和密码（密码不回显），程序自动完成\n  登录 → 发布续期凭据 → 换取 ProxyPass 并验证。\n  已开启两步验证（2FA）的账号会在提示时输入验证码。\n\n方式二：从本机 Firefox 导出\n1. 在本机 Firefox 登录 Firefox Account，启用 IP Protection，并完成设备注册。\n2. 在本机运行：fxpool-proxy export-credentials\n   程序会自动读取配置目录中的 signedInUser.json，写出最小续期凭据包。\n3. 同机可直接：fxpool-proxy export-credentials --import\n   或把凭据包拷到 VPS 后：fxpool-proxy import-credentials /path/to/file --delete-source\n4. 用 fxpool-proxy token-status 检查续期状态。\n\n完整步骤见 README.md；凭据等同登录会话，不要分享。\n")
 }
 func cmdExport(c *config, out, profile, firefoxDir string, listOnly, doImport, noVerify bool) int {
 	var cands []fxaexport.Candidate
@@ -324,7 +410,7 @@ func cmdProbe(c *config) int {
 	var chosen *serverlist.Node
 	for i := range nodes {
 		n := &nodes[i]
-		if n.Supported && !n.Locked && n.Country != "REC" && (c.country == "" || strings.EqualFold(c.country, n.Country)) {
+		if n.Supported && !n.Locked && n.Protocol == "connect" && n.Country != "REC" && (c.country == "" || strings.EqualFold(c.country, n.Country)) {
 			chosen = n
 			break
 		}
@@ -383,7 +469,16 @@ func cmdRun(c *config) int {
 		return 1
 	}
 	nodes = filterNodes(nodes, c)
-	if len(nodes) == 0 {
+	var masqueNodes []serverlist.Node
+	if c.masqueURI != "" {
+		mn, e := masqueNodeFromURI(c.masqueURI)
+		if e != nil {
+			safeError(e)
+			return 2
+		}
+		masqueNodes = append(masqueNodes, mn)
+	}
+	if len(nodes) == 0 && len(masqueNodes) == 0 {
 		safeError(errors.New("no usable nodes selected"))
 		return 1
 	}
@@ -451,9 +546,25 @@ func cmdRun(c *config) int {
 		}
 	}
 	servers = append(servers, aggregate)
+	var udpSrv *pool.UDPServer
+	var udpAddr string
+	if len(masqueNodes) > 0 {
+		udpSrv = pool.NewUDPServer(dial, masqueNodes)
+		udpListen := net.JoinHostPort(c.bind, strconv.Itoa(c.udpBase))
+		a, e := udpSrv.Listen(udpListen)
+		if e != nil {
+			safeError(e)
+			return 1
+		}
+		udpAddr = a.String()
+		defer func() { _ = udpSrv.Close() }()
+	}
 	if e = export(c, eps); e != nil {
 		safeError(e)
 		return 1
+	}
+	if udpAddr != "" {
+		fmt.Printf("[*] UDP relay (SOCKS5 UDP ASSOCIATE via MASQUE): %s\n", udpAddr)
 	}
 	fmt.Printf("[*] pool running: nodes=%d (credentials omitted)\n", len(eps))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -516,6 +627,42 @@ func filterNodes(nodes []serverlist.Node, c *config) []serverlist.Node {
 		}
 	}
 	return out
+}
+
+// masqueNodeFromURI builds a MASQUE upstream node from a user-supplied URI
+// template such as https://host:443/.well-known/masque/udp/{target_host}/{target_port}/.
+// The template's host:port becomes the QUIC endpoint.
+func masqueNodeFromURI(uri string) (serverlist.Node, error) {
+	if !strings.HasPrefix(uri, "https://") {
+		return serverlist.Node{}, errors.New("masque-uri must be an https:// URI template")
+	}
+	u, e := url.Parse(uri)
+	if e != nil || u.Host == "" {
+		return serverlist.Node{}, errors.New("invalid masque-uri: " + uri)
+	}
+	host, port, e := net.SplitHostPort(u.Host)
+	if e != nil {
+		host, port, e = u.Host, "443", nil
+		if e != nil {
+			return serverlist.Node{}, e
+		}
+	}
+	p, e := strconv.Atoi(port)
+	if e != nil || p < 1 || p > 65535 {
+		return serverlist.Node{}, errors.New("invalid masque-uri port: " + port)
+	}
+	return serverlist.Node{
+		Country: "REC", CountryName: "MASQUE", City: "MASQUE", CityName: "Configured MASQUE proxy",
+		Hostname:       strings.ToLower(host),
+		Port:           p,
+		Protocol:       "masque",
+		Scheme:         "https",
+		Supported:      true,
+		RecordID:       "masque-config",
+		TemplateString: uri,
+		MasqueHost:     strings.ToLower(host),
+		MasquePort:     p,
+	}, nil
 }
 func disabled(s string) bool {
 	s = strings.ToLower(s)

@@ -36,6 +36,13 @@ type Node struct {
 	FilterExpression  string `json:"filter_expression,omitempty"`
 	LastModified      int64  `json:"last_modified,omitempty"`
 	FilterMatched     bool   `json:"filter_matched"`
+	// MASQUE (HTTP/3 CONNECT-UDP) fields. TemplateString is the URI template
+	// used to reach the proxy, e.g. https://host/.well-known/masque/udp/{target}/{port}/.
+	// MasqueHost / MasquePort identify the QUIC endpoint when it differs from the
+	// CONNECT endpoint carried in Hostname / Port.
+	TemplateString string `json:"template_string,omitempty"`
+	MasqueHost     string `json:"masque_host,omitempty"`
+	MasquePort     int    `json:"masque_port,omitempty"`
 }
 
 func (n Node) StableID() string {
@@ -147,12 +154,13 @@ func compare(v int, op string) bool {
 }
 
 type protocol struct {
-	Protocol string `json:"protocol"`
-	Name     string `json:"name"`
-	Scheme   string `json:"scheme"`
-	Host     string `json:"host"`
-	Hostname string `json:"hostname"`
-	Port     int    `json:"port"`
+	Protocol       string `json:"protocol"`
+	Name           string `json:"name"`
+	Scheme         string `json:"scheme"`
+	Host           string `json:"host"`
+	Hostname       string `json:"hostname"`
+	Port           int    `json:"port"`
+	TemplateString string `json:"templateString"`
 }
 type server struct {
 	Hostname    string     `json:"hostname"`
@@ -211,14 +219,25 @@ func Parse(raw []byte, firefoxVersion, country string, includeLocked bool) ([]No
 				if s.Quarantined || (locked && !includeLocked) {
 					continue
 				}
-				host, port, proto, scheme, supported, reason := selectProtocol(s)
-				if net.ParseIP(host) == nil && !validDNS(host) {
-					continue
-				}
+				host, port, proto, scheme, supported, reason, template, masqueHost, masquePort := selectProtocol(s)
 				if host == "" || port < 1 || port > 65535 {
 					continue
 				}
-				n := Node{strings.ToUpper(r.Code), countryName, c.Code, c.Name, strings.ToLower(host), port, proto, scheme, locked, supported, reason, r.ID, r.Filter, r.LastModified, eligible}
+				if net.ParseIP(host) == nil && !validDNS(host) {
+					continue
+				}
+				n := Node{
+					Country: strings.ToUpper(r.Code), CountryName: countryName,
+					City: c.Code, CityName: c.Name,
+					Hostname: strings.ToLower(host), Port: port,
+					Protocol: proto, Scheme: scheme,
+					Locked: locked, Supported: supported,
+					UnsupportedReason: reason,
+					RecordID:          r.ID, FilterExpression: r.Filter,
+					LastModified: r.LastModified, FilterMatched: eligible,
+					TemplateString: template,
+					MasqueHost:     strings.ToLower(masqueHost), MasquePort: masquePort,
+				}
 				if !seen[n.StableID()] {
 					seen[n.StableID()] = true
 					out = append(out, n)
@@ -228,28 +247,52 @@ func Parse(raw []byte, firefoxVersion, country string, includeLocked bool) ([]No
 	}
 	return out, nil
 }
-func selectProtocol(s server) (string, int, string, string, bool, string) {
+func selectProtocol(s server) (string, int, string, string, bool, string, string, string, int) {
 	port := s.Port
 	if port == 0 {
 		port = 443
 	}
 	if len(s.Protocols) == 0 {
-		return s.Hostname, port, "connect", "https", true, ""
+		return s.Hostname, port, "connect", "https", true, "", "", "", 0
 	}
+	// Prefer a MASQUE protocol with a usable templateString, then fall back to
+	// a CONNECT protocol. A MASQUE entry without a template is not usable on its
+	// own, so we keep walking the chain to find a CONNECT alternative.
+	masqueCandidate := ""
 	for _, p := range s.Protocols {
 		name := strings.ToLower(first(p.Protocol, p.Name))
-		if name == "connect" {
-			host := first(p.Host, p.Hostname, s.Hostname)
-			pp := p.Port
-			if pp == 0 {
-				pp = port
+		host := first(p.Host, p.Hostname, s.Hostname)
+		pp := p.Port
+		if pp == 0 {
+			pp = port
+		}
+		switch name {
+		case "masque":
+			if p.TemplateString != "" {
+				return host, pp, name, first(p.Scheme, "https"), true, "", p.TemplateString, host, pp
 			}
+			if masqueCandidate == "" {
+				masqueCandidate = name
+			}
+		case "connect":
 			scheme := first(p.Scheme, "https")
 			if !strings.EqualFold(scheme, "https") {
-				return host, pp, name, scheme, false, "unsupported CONNECT scheme: " + scheme
+				return host, pp, name, scheme, false, "unsupported CONNECT scheme: " + scheme, "", "", 0
 			}
-			return host, pp, name, strings.ToLower(scheme), true, ""
+			return host, pp, name, strings.ToLower(scheme), true, "", "", "", 0
 		}
+	}
+	// No usable CONNECT found among the chain. If a MASQUE entry existed but
+	// lacked a template, surface it as unsupported rather than silently
+	// misusing anything.
+	if masqueCandidate != "" {
+		p := s.Protocols[0]
+		host := first(p.Host, p.Hostname, s.Hostname)
+		pp := p.Port
+		if pp == 0 {
+			pp = port
+		}
+		return host, pp, "masque", first(p.Scheme, "https"), false, "MASQUE protocol without templateString", "", "", 0
 	}
 	p := s.Protocols[0]
 	name := strings.ToLower(first(p.Protocol, p.Name, "unknown"))
@@ -258,7 +301,7 @@ func selectProtocol(s server) (string, int, string, string, bool, string) {
 	if pp == 0 {
 		pp = port
 	}
-	return host, pp, name, first(p.Scheme, "https"), false, "unsupported upstream protocol chain (first available: " + name + ")"
+	return host, pp, name, first(p.Scheme, "https"), false, "unsupported upstream protocol chain (first available: " + name + ")", "", "", 0
 }
 func first(v ...string) string {
 	for _, s := range v {
@@ -312,11 +355,11 @@ func (s Store) Fetch(ctx context.Context, force bool, firefoxVersion, country st
 			return nil, e
 		}
 		for _, v := range n {
-			if v.Supported && !v.Locked {
+			if v.Supported && !v.Locked && (v.Protocol == "connect" || v.Protocol == "masque") {
 				return n, nil
 			}
 		}
-		return nil, errors.New("vpn-serverlist contains no usable CONNECT nodes")
+		return nil, errors.New("vpn-serverlist contains no usable CONNECT or MASQUE nodes")
 	}
 	if !force && len(cached) > 0 && time.Since(time.Unix(int64(m.FetchedAt), 0)) < time.Hour {
 		if n, e := parse(cached); e == nil {

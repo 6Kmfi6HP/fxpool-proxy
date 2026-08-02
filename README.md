@@ -2,10 +2,14 @@
 
 纯 Go 实现的本地 SOCKS5 / HTTP 代理池：把流量经 Firefox IP Protection
 （Mozilla Guardian ProxyPass + TLS HTTP CONNECT）送出，并自动续期凭据、
-同步 Remote Settings 节点列表。
+同步 Remote Settings 节点列表。可选配置 `--masque-uri` 后，额外提供
+**SOCKS5 UDP ASSOCIATE 中继**，把 UDP 流量经 **MASQUE（HTTP/3 CONNECT-UDP，
+RFC 9298）** 隧道出口。
 
-不支持 MASQUE / HTTP3 / QUIC / UDP；未知上游协议、未知过滤表达式、未鉴权的
-非回环监听均会 fail closed。与 Mozilla / Firefox / Fastly 无官方隶属关系。
+TCP 流量始终走 HTTPS CONNECT；MASQUE CONNECT-UDP 只承载 UDP（如 QUIC/HTTP3/DNS），
+由 `--masque-uri` 指向的代理端点承担。不支持 MASQUE/HTTP3 时行为与旧版一致。
+未知上游协议、未知过滤表达式、未鉴权的非回环监听均会 fail closed。
+与 Mozilla / Firefox / Fastly 无官方隶属关系。
 
 要求 Go 1.25+（一键安装会自动 `go build`）。Linux 建议配合 systemd。
 
@@ -111,6 +115,7 @@ make cross   # /tmp/fxpool-proxy-linux-{amd64,arm64}
 
 | 步骤 | 命令 |
 |------|------|
+| 邮箱+密码自动登录（推荐） | `./fxpool-proxy login` |
 | 列出本机 Firefox 配置 | `./fxpool-proxy export-credentials --list` |
 | 导出续期包 | `./fxpool-proxy export-credentials -o bundle.json` |
 | 导出并写入 `tokens/` | `./fxpool-proxy export-credentials --import` |
@@ -118,8 +123,14 @@ make cross   # /tmp/fxpool-proxy-linux-{amd64,arm64}
 | 查看状态 | `./fxpool-proxy token-status` |
 | 强制刷新 ProxyPass | `./fxpool-proxy token-refresh --force` |
 
-流程：读取 Firefox `signedInUser.json` → 最小续期包（email / uid / session）→
-FxA HAWK + PKCE OAuth → Guardian ProxyPass JWT → `tokens/proxy_pass.jwt`。
+`login` 交互式输入 FxA 邮箱与密码（密码不回显），自动完成登录、发布续期凭据
+并换取 ProxyPass 验证；无需本机已登录的 Firefox。已启用两步验证（2FA）的账号
+会在提示时输入验证码。可选 `--email`、`--no-verify`（发布但不刷新验证）、
+`--totp CODE`（非交互提供验证码）。
+
+流程：`login` 直接派生 authPW 登录 FxA，或读取 Firefox `signedInUser.json` →
+最小续期包（email / uid / session）→ FxA HAWK + PKCE OAuth → Guardian ProxyPass
+JWT → `tokens/proxy_pass.jwt`。
 
 JWT 会校验结构、算法（拒绝 `none`）、issuer、audience、时间与最小 TTL；
 Guardian 无稳定 JWKS 合约，**不验证 JWT 签名**。
@@ -137,6 +148,7 @@ Guardian 无稳定 JWKS 合约，**不验证 JWT 签名**。
 | 综合 HTTP | `:8080` |
 | 每节点 SOCKS5 | `--socks-base` 起，默认 `21000+` |
 | 每节点 HTTP | `--http-base` 起，默认 `31000+` |
+| UDP 中继（MASQUE，SOCKS5 UDP ASSOCIATE） | `--udp-base` 起，默认 `41000`（需 `--masque-uri`） |
 
 端口映射持久化在 `data/port-map.json`。验证：
 
@@ -174,6 +186,7 @@ fxpool-proxy version
 | `token-refresh` | 刷新 ProxyPass |
 | `usage` | Guardian 配额 |
 | `probe` | 经一节点 CONNECT 探测 ipinfo.io |
+| `login` | 邮箱+密码自动登录并发布续期凭据 |
 | `run` | 启动代理池 |
 | `how-to-token` | 打印凭据步骤摘要 |
 
@@ -200,6 +213,8 @@ fxpool-proxy version
 | `FXPOOL_FXA_TOKEN` | 临时 FxA OAuth access token | — |
 | `FXPOOL_FIREFOX_VERSION` | Remote Settings 过滤用版本 | 内置默认 |
 | `FXPOOL_CLIENT_COUNTRY` | 客户端国家过滤上下文 | — |
+| `FXPOOL_MASQUE_URI` | MASQUE 代理 URI 模板（启用 UDP 中继） | — |
+| `FXPOOL_UDP_BASE` | UDP 中继起始端口 | `41000` |
 | `FXPOOL_BINARY` | 二进制路径 | `./fxpool-proxy` |
 | `FXPOOL_REFRESH_BEFORE_START` | `install.sh run` 启动前刷新 | `1` |
 | `FXPOOL_LIMIT` | 节点数上限 | — |

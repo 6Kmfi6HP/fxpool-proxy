@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"fxpool-proxy/internal/fxa"
 	"fxpool-proxy/internal/securefile"
 )
 
@@ -111,6 +112,26 @@ func NewManager(root, guardian string) *Manager {
 		guardian = "https://vpn.mozilla.org"
 	}
 	return &Manager{Root: root, Guardian: strings.TrimRight(guardian, "/"), FxAAuth: "https://api.accounts.firefox.com/v1", FxAOAuth: "https://oauth.accounts.firefox.com/v1", Client: &http.Client{Timeout: 15 * time.Second}}
+}
+
+// Login authenticates an FxA email+password, publishes the resulting renewal
+// credentials, and exchanges them for a fresh ProxyPass. On success the
+// renewal_credentials.json is written (0600) and the caller can Refresh() to
+// verify the whole chain. The password is not retained.
+func (m *Manager) Login(ctx context.Context, email, password string, opts ...func(*fxa.Client)) (*fxa.Session, error) {
+	fc := &fxa.Client{Base: m.FxAAuth, HTTP: m.Client}
+	for _, o := range opts {
+		o(fc)
+	}
+	s, err := fc.Login(ctx, email, password)
+	if err != nil {
+		return nil, err
+	}
+	cred := Credentials{Schema: 1, Email: s.Email, UID: s.UID, SessionToken: s.SessionToken}
+	if err := m.PublishCredentials(cred); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 func (m *Manager) tokenPath() string { return filepath.Join(m.Root, "tokens", "proxy_pass.jwt") }
 func (m *Manager) statePath() string { return filepath.Join(m.Root, "tokens", "refresh_state.json") }
