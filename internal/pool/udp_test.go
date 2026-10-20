@@ -118,12 +118,14 @@ func TestUDPServerIsolatesTunnelsPerClient(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer cli1.Close()
+	srv.AllowClient(cli1.LocalAddr())
 
 	cli2, e := net.DialUDP("udp4", nil, udpAddr)
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer cli2.Close()
+	srv.AllowClient(cli2.LocalAddr())
 
 	// Client 1 sends first.
 	if _, e = cli1.Write(makeFrame("from-client1")); e != nil {
@@ -200,6 +202,9 @@ func TestUDPServerRelaysSOCKS5Frames(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer cli.Close()
+	// Register the client as authorized (simulates a successful SOCKS5 UDP
+	// ASSOCIATE handshake) so its datagrams pass the auth check.
+	srv.AllowClient(cli.LocalAddr())
 	if _, e = cli.Write(frame); e != nil {
 		t.Fatal(e)
 	}

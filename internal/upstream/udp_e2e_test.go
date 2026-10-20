@@ -81,6 +81,10 @@ func TestUDPServerEndToEndMASQUE(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer cli2.Close()
+	// Register both client IPs — simulates a successful SOCKS5 UDP ASSOCIATE
+	// handshake that a real SOCKS5 server would perform before accepting UDP.
+	srv.AllowClient(cli1.LocalAddr())
+	srv.AllowClient(cli2.LocalAddr())
 
 	// Both clients send to the same destination; each must get its own tunnel.
 	if _, e = cli1.Write(makeFrame("e2e-client1")); e != nil {

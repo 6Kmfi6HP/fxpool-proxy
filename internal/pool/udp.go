@@ -24,6 +24,10 @@ type UDPDialer interface {
 // A per-(client, destination) CONNECT-UDP tunnel is opened on demand. Replies
 // are framed with the SOCKS5 UDP header of the destination and sent back to
 // the originating client address.
+//
+// Clients must be registered via AllowClient before their datagrams are
+// forwarded. The SOCKS5 handler calls AllowClient after a successful UDP
+// ASSOCIATE handshake so unauthenticated senders are silently dropped.
 type UDPServer struct {
 	Dialer  UDPDialer
 	Nodes   []serverlist.Node
@@ -32,11 +36,38 @@ type UDPServer struct {
 	cancel  context.CancelFunc
 	mu      sync.Mutex
 	tunnels map[string]net.PacketConn // key: client|destination
+	allowed map[string]struct{}       // key: client IP (no port)
 	wg      sync.WaitGroup
 }
 
 func NewUDPServer(d UDPDialer, nodes []serverlist.Node) *UDPServer {
-	return &UDPServer{Dialer: d, Nodes: nodes, tunnels: map[string]net.PacketConn{}}
+	return &UDPServer{Dialer: d, Nodes: nodes, tunnels: map[string]net.PacketConn{}, allowed: map[string]struct{}{}}
+}
+
+// AllowClient registers the client IP as authorized to use the UDP relay.
+// Called by the SOCKS5 handler after a successful UDP ASSOCIATE handshake.
+// Only the IP is checked; the ephemeral UDP source port may differ from the
+// TCP control connection port.
+func (s *UDPServer) AllowClient(addr net.Addr) {
+	ip := addrIP(addr)
+	if ip == "" {
+		return
+	}
+	s.mu.Lock()
+	s.allowed[ip] = struct{}{}
+	s.mu.Unlock()
+}
+
+// addrIP extracts the host portion of a net.Addr, stripping the port.
+func addrIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	h, _, e := net.SplitHostPort(addr.String())
+	if e != nil {
+		return addr.String()
+	}
+	return h
 }
 
 // Listen binds the UDP relay socket and starts serving. Returns the bound
@@ -84,7 +115,25 @@ func (s *UDPServer) readLoop() {
 	}
 }
 
+// isAllowed reports whether raddr's IP has been registered via AllowClient.
+func (s *UDPServer) isAllowed(raddr net.Addr) bool {
+	ip := addrIP(raddr)
+	if ip == "" {
+		return false
+	}
+	s.mu.Lock()
+	_, ok := s.allowed[ip]
+	s.mu.Unlock()
+	return ok
+}
+
 func (s *UDPServer) handlePacket(pkt []byte, raddr net.Addr) {
+	// Drop datagrams from clients that have not completed a SOCKS5 UDP
+	// ASSOCIATE handshake on the companion TCP listener. This gates the relay
+	// behind the same authentication mechanism as the TCP tunnels.
+	if !s.isAllowed(raddr) {
+		return
+	}
 	if len(pkt) < 7 || pkt[2] != 0 {
 		return // unsupported FRAG
 	}

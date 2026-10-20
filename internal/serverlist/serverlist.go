@@ -219,89 +219,103 @@ func Parse(raw []byte, firefoxVersion, country string, includeLocked bool) ([]No
 				if s.Quarantined || (locked && !includeLocked) {
 					continue
 				}
-				host, port, proto, scheme, supported, reason, template, masqueHost, masquePort := selectProtocol(s)
-				if host == "" || port < 1 || port > 65535 {
-					continue
-				}
-				if net.ParseIP(host) == nil && !validDNS(host) {
-					continue
-				}
-				n := Node{
-					Country: strings.ToUpper(r.Code), CountryName: countryName,
-					City: c.Code, CityName: c.Name,
-					Hostname: strings.ToLower(host), Port: port,
-					Protocol: proto, Scheme: scheme,
-					Locked: locked, Supported: supported,
-					UnsupportedReason: reason,
-					RecordID:          r.ID, FilterExpression: r.Filter,
-					LastModified: r.LastModified, FilterMatched: eligible,
-					TemplateString: template,
-					MasqueHost:     strings.ToLower(masqueHost), MasquePort: masquePort,
-				}
-				if !seen[n.StableID()] {
-					seen[n.StableID()] = true
-					out = append(out, n)
+				for _, n := range serverNodes(s, r, c, countryName, locked, eligible) {
+					if host := n.Hostname; net.ParseIP(host) == nil && !validDNS(host) {
+						continue
+					}
+					if !seen[n.StableID()] {
+						seen[n.StableID()] = true
+						out = append(out, n)
+					}
 				}
 			}
 		}
 	}
 	return out, nil
 }
-func selectProtocol(s server) (string, int, string, string, bool, string, string, string, int) {
+// serverNodes extracts zero, one, or two Node values from a single server
+// record. A server that advertises both a usable MASQUE template and a CONNECT
+// protocol produces two nodes: a MASQUE node (for UDP relay) and a CONNECT
+// node (for TCP tunnelling). Callers deduplicate with seen[StableID()].
+func serverNodes(s server, r record, c city, countryName string, locked bool, eligible bool) []Node {
+	base := Node{
+		Country: strings.ToUpper(r.Code), CountryName: countryName,
+		City: c.Code, CityName: c.Name,
+		Locked: locked, FilterMatched: eligible,
+		RecordID: r.ID, FilterExpression: r.Filter, LastModified: r.LastModified,
+	}
 	port := s.Port
 	if port == 0 {
 		port = 443
 	}
 	if len(s.Protocols) == 0 {
-		return s.Hostname, port, "connect", "https", true, "", "", "", 0
+		n := base
+		n.Hostname, n.Port, n.Protocol, n.Scheme, n.Supported = strings.ToLower(s.Hostname), port, "connect", "https", true
+		if n.Hostname == "" || n.Port < 1 || n.Port > 65535 {
+			return nil
+		}
+		return []Node{n}
 	}
-	// Prefer a MASQUE protocol with a usable templateString, then fall back to
-	// a CONNECT protocol. A MASQUE entry without a template is not usable on its
-	// own, so we keep walking the chain to find a CONNECT alternative.
-	masqueCandidate := ""
+	var masqueNode, connectNode *Node
 	for _, p := range s.Protocols {
 		name := strings.ToLower(first(p.Protocol, p.Name))
-		host := first(p.Host, p.Hostname, s.Hostname)
+		host := strings.ToLower(first(p.Host, p.Hostname, s.Hostname))
 		pp := p.Port
 		if pp == 0 {
 			pp = port
+		}
+		if host == "" || pp < 1 || pp > 65535 {
+			continue
 		}
 		switch name {
 		case "masque":
-			if p.TemplateString != "" {
-				return host, pp, name, first(p.Scheme, "https"), true, "", p.TemplateString, host, pp
-			}
-			if masqueCandidate == "" {
-				masqueCandidate = name
+			if p.TemplateString != "" && masqueNode == nil {
+				n := base
+				n.Hostname, n.Port = host, pp
+				n.Protocol, n.Scheme, n.Supported = "masque", first(p.Scheme, "https"), true
+				n.TemplateString = p.TemplateString
+				n.MasqueHost, n.MasquePort = host, pp
+				masqueNode = &n
 			}
 		case "connect":
-			scheme := first(p.Scheme, "https")
-			if !strings.EqualFold(scheme, "https") {
-				return host, pp, name, scheme, false, "unsupported CONNECT scheme: " + scheme, "", "", 0
+			if connectNode == nil {
+				scheme := strings.ToLower(first(p.Scheme, "https"))
+				n := base
+				n.Hostname, n.Port = host, pp
+				n.Protocol, n.Scheme = "connect", scheme
+				if strings.EqualFold(scheme, "https") {
+					n.Supported = true
+				} else {
+					n.UnsupportedReason = "unsupported CONNECT scheme: " + scheme
+				}
+				connectNode = &n
 			}
-			return host, pp, name, strings.ToLower(scheme), true, "", "", "", 0
 		}
 	}
-	// No usable CONNECT found among the chain. If a MASQUE entry existed but
-	// lacked a template, surface it as unsupported rather than silently
-	// misusing anything.
-	if masqueCandidate != "" {
+	var out []Node
+	if masqueNode != nil {
+		out = append(out, *masqueNode)
+	}
+	if connectNode != nil {
+		out = append(out, *connectNode)
+	}
+	if len(out) == 0 {
+		// No usable protocol found; fall back to the first entry as unsupported.
 		p := s.Protocols[0]
-		host := first(p.Host, p.Hostname, s.Hostname)
+		host := strings.ToLower(first(p.Host, p.Hostname, s.Hostname))
 		pp := p.Port
 		if pp == 0 {
 			pp = port
 		}
-		return host, pp, "masque", first(p.Scheme, "https"), false, "MASQUE protocol without templateString", "", "", 0
+		name := strings.ToLower(first(p.Protocol, p.Name, "unknown"))
+		if host != "" && pp >= 1 && pp <= 65535 {
+			n := base
+			n.Hostname, n.Port, n.Protocol, n.Scheme = host, pp, name, first(p.Scheme, "https")
+			n.UnsupportedReason = "unsupported upstream protocol chain (first available: " + name + ")"
+			out = append(out, n)
+		}
 	}
-	p := s.Protocols[0]
-	name := strings.ToLower(first(p.Protocol, p.Name, "unknown"))
-	host := first(p.Host, p.Hostname, s.Hostname)
-	pp := p.Port
-	if pp == 0 {
-		pp = port
-	}
-	return host, pp, name, first(p.Scheme, "https"), false, "unsupported upstream protocol chain (first available: " + name + ")", "", "", 0
+	return out
 }
 func first(v ...string) string {
 	for _, s := range v {

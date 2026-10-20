@@ -289,6 +289,17 @@ func cmdLogin(c *config, email string, noVerify bool, totp string) int {
 		opts = append(opts, func(fc *fxa.Client) {
 			fc.TOTPPrompt = func() (string, error) { return totp, nil }
 		})
+	} else {
+		// Install an interactive prompt so 2FA-enabled accounts aren't stuck;
+		// the flag path above still lets callers supply the code non-interactively.
+		opts = append(opts, func(fc *fxa.Client) {
+			fc.TOTPPrompt = func() (string, error) {
+				fmt.Fprint(os.Stderr, "Two-factor code: ")
+				code, err := readPassword()
+				fmt.Fprintln(os.Stderr)
+				return strings.TrimSpace(code), err
+			}
+		})
 	}
 	sess, e := m.Login(ctx, email, password, opts...)
 	if e != nil {
