@@ -5,6 +5,17 @@
 
 ## 优先使用本仓库命令
 
+**方式一（推荐，无需本机 Firefox）：邮箱+密码自动登录**
+
+```bash
+./fxpool-proxy login
+```
+
+按提示输入 FxA 邮箱和密码（密码不回显），程序自动完成登录、发布续期凭据、
+换取 ProxyPass 并验证。已开启两步验证（2FA）的账号会在提示时输入验证码。
+
+**方式二：从本机已登录的 Firefox 导出**
+
 ```bash
 ./fxpool-proxy how-to-token
 ./fxpool-proxy export-credentials --list

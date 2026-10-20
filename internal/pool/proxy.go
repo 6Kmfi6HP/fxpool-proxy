@@ -28,12 +28,16 @@ type Server struct {
 	Selector           *Selector
 	Username, Password string
 	AllowOpen          bool
-	listeners          []net.Listener
-	connections        map[net.Conn]struct{}
-	connMu             sync.Mutex
-	wg                 sync.WaitGroup
-	ctx                context.Context
-	cancel             context.CancelFunc
+	// UDPRelay, when set, allows this SOCKS5 server to handle UDP ASSOCIATE
+	// (CMD=3) by telling the client the relay address and registering its IP
+	// as authorized. Without this, CMD=3 returns "command not supported".
+	UDPRelay    *UDPServer
+	listeners   []net.Listener
+	connections map[net.Conn]struct{}
+	connMu      sync.Mutex
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 func (s *Server) StartSOCKS(addr string) (net.Addr, error) { return s.start(addr, s.handleSOCKS) }
@@ -144,7 +148,14 @@ func (s *Server) handleSOCKS(c net.Conn) {
 		_, _ = c.Write([]byte{1, 0})
 	}
 	r, e := readExact(c, 4)
-	if e != nil || r[0] != 5 || r[1] != 1 {
+	if e != nil || r[0] != 5 {
+		_, _ = c.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	cmd := r[1]
+	if cmd != 1 && !(cmd == 3 && s.UDPRelay != nil) {
+		// CMD=1 (CONNECT) is always supported; CMD=3 (UDP ASSOCIATE) requires
+		// a configured UDPRelay. All other commands are unsupported.
 		_, _ = c.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -181,6 +192,34 @@ func (s *Server) handleSOCKS(c net.Conn) {
 		return
 	}
 	port := int(pb[0])<<8 | int(pb[1])
+	if cmd == 3 {
+		// UDP ASSOCIATE: register this client's IP as authorized and tell it
+		// the relay's listen address. The TCP control connection is held open
+		// until the client closes it; when it closes we have no reliable way to
+		// de-register the IP (another session from the same host may still be
+		// active) so we keep it registered for the lifetime of the process.
+		relayAddr := s.UDPRelay.conn.LocalAddr()
+		bindIP, bindPort, _ := net.SplitHostPort(relayAddr.String())
+		bp, _ := strconv.Atoi(bindPort)
+		// Send the bind address back to the client in the SOCKS5 reply frame.
+		var reply []byte
+		if ip4 := net.ParseIP(bindIP).To4(); ip4 != nil {
+			reply = []byte{5, 0, 0, 1, ip4[0], ip4[1], ip4[2], ip4[3], byte(bp >> 8), byte(bp)}
+		} else {
+			// IPv6 — encode as ATYP=4.
+			ip6 := net.ParseIP(bindIP).To16()
+			reply = append([]byte{5, 0, 0, 4}, ip6...)
+			reply = append(reply, byte(bp>>8), byte(bp))
+		}
+		s.UDPRelay.AllowClient(c.RemoteAddr())
+		_, _ = c.Write(reply)
+		// Hold the TCP control connection open. The client will close it when
+		// it is done with the UDP association; until then we block here.
+		_ = c.SetDeadline(time.Time{})
+		buf := make([]byte, 1)
+		_, _ = c.Read(buf) // blocks until client closes the connection
+		return
+	}
 	up, e := s.open(host, port)
 	if e != nil {
 		_, _ = c.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})

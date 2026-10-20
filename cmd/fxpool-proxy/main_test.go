@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,6 +56,65 @@ func TestCredentialImportNoVerify(t *testing.T) {
 	}
 	if got := run([]string{"import-credentials", bundle, "--no-verify", "--root", root}); got != 0 {
 		t.Fatalf("exit %d", got)
+	}
+	info, e := os.Stat(filepath.Join(root, "tokens", "renewal_credentials.json"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %o", info.Mode().Perm())
+	}
+}
+
+func TestLoginCommandPublishNoVerify(t *testing.T) {
+	// A fake FxA auth server accepting the v1 vector.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/account/credentials/status":
+			w.Write([]byte(`{"email":"andré@example.org","verifierVersion":1}`))
+		case "/account/login":
+			var body struct {
+				AuthPW string `json:"authPW"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.AuthPW != "247b675ffb4c46310bc87e26d712153abe5e1c90ef00a4784594f97ef54f2375" {
+				w.WriteHeader(http.StatusBadRequest)
+				w.Write([]byte(`{"code":400,"errno":103,"error":"Incorrect password"}`))
+				return
+			}
+			w.Write([]byte(`{"uid":"0123456789abcdef0123456789abcdef","sessionToken":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	root := t.TempDir()
+	// Feed just the password over stdin (non-terminal read path); email via flag.
+	stdin := "pässwörd\n"
+	oldStdin := os.Stdin
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(stdin)
+	_ = w.Close()
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin })
+
+	if got := run([]string{"login", "--email", "andré@example.org", "--root", root, "--fxa-base", srv.URL, "--no-verify"}); got != 0 {
+		t.Fatalf("exit %d", got)
+	}
+	b, e := os.ReadFile(filepath.Join(root, "tokens", "renewal_credentials.json"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	var cred struct {
+		Email        string `json:"email"`
+		SessionToken string `json:"session_token"`
+	}
+	if e := json.Unmarshal(b, &cred); e != nil {
+		t.Fatal(e)
+	}
+	if cred.Email != "andré@example.org" || cred.SessionToken != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("credential mismatch: %+v", cred)
 	}
 	info, e := os.Stat(filepath.Join(root, "tokens", "renewal_credentials.json"))
 	if e != nil {
