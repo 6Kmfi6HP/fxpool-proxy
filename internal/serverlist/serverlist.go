@@ -233,6 +233,7 @@ func Parse(raw []byte, firefoxVersion, country string, includeLocked bool) ([]No
 	}
 	return out, nil
 }
+
 // serverNodes extracts zero, one, or two Node values from a single server
 // record. A server that advertises both a usable MASQUE template and a CONNECT
 // protocol produces two nodes: a MASQUE node (for UDP relay) and a CONNECT

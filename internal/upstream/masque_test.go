@@ -217,8 +217,8 @@ func TestMasqueEndpoint(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "MasqueHost set but MasquePort zero falls back to template parse",
-			node:    serverlist.Node{MasqueHost: "proxy.example.com", MasquePort: 0, TemplateString: "https://proxy.example.com:1234/.well-known/masque/udp/{target_host}/{target_port}/"},
+			name:     "MasqueHost set but MasquePort zero falls back to template parse",
+			node:     serverlist.Node{MasqueHost: "proxy.example.com", MasquePort: 0, TemplateString: "https://proxy.example.com:1234/.well-known/masque/udp/{target_host}/{target_port}/"},
 			wantHost: "proxy.example.com", wantPort: 1234,
 		},
 	}

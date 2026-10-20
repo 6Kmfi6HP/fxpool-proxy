@@ -31,13 +31,13 @@ type Server struct {
 	// UDPRelay, when set, allows this SOCKS5 server to handle UDP ASSOCIATE
 	// (CMD=3) by telling the client the relay address and registering its IP
 	// as authorized. Without this, CMD=3 returns "command not supported".
-	UDPRelay   *UDPServer
-	listeners  []net.Listener
+	UDPRelay    *UDPServer
+	listeners   []net.Listener
 	connections map[net.Conn]struct{}
-	connMu     sync.Mutex
-	wg         sync.WaitGroup
-	ctx        context.Context
-	cancel     context.CancelFunc
+	connMu      sync.Mutex
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 func (s *Server) StartSOCKS(addr string) (net.Addr, error) { return s.start(addr, s.handleSOCKS) }

@@ -68,7 +68,7 @@ func (d *fakeUDPDialer) OpenUDP(ctx context.Context, n serverlist.Node, host str
 // each (client, destination) pair gets its own tunnel. This models the real
 // MASQUE dialer, which opens a new QUIC connection per call.
 type perClientUDPDialer struct {
-	mu   sync.Mutex
+	mu    sync.Mutex
 	conns []*fakePacketConn
 }
 
@@ -178,6 +178,7 @@ func TestUDPServerIsolatesTunnelsPerClient(t *testing.T) {
 		t.Fatalf("client2 got wrong reply: %q", buf[:n])
 	}
 }
+
 // verifies the payload is forwarded to the MASQUE tunnel and the reply is
 // framed back to the client.
 func TestUDPServerRelaysSOCKS5Frames(t *testing.T) {
