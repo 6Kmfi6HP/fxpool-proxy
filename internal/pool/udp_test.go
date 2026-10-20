@@ -64,7 +64,118 @@ func (d *fakeUDPDialer) OpenUDP(ctx context.Context, n serverlist.Node, host str
 	return d.pc, nil
 }
 
-// TestUDPServerRelaysSOCKS5Frames feeds a SOCKS5 UDP ASSOCIATE datagram and
+// perClientUDPDialer returns a fresh fakePacketConn for each OpenUDP call so
+// each (client, destination) pair gets its own tunnel. This models the real
+// MASQUE dialer, which opens a new QUIC connection per call.
+type perClientUDPDialer struct {
+	mu   sync.Mutex
+	conns []*fakePacketConn
+}
+
+func (d *perClientUDPDialer) OpenUDP(ctx context.Context, n serverlist.Node, host string, port int) (net.PacketConn, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	pc := newFakePacketConn()
+	d.conns = append(d.conns, pc)
+	return pc, nil
+}
+
+func (d *perClientUDPDialer) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.conns)
+}
+
+func (d *perClientUDPDialer) get(i int) *fakePacketConn {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.conns[i]
+}
+
+// TestUDPServerIsolatesTunnelsPerClient verifies that two clients sending to the
+// same destination each get their own tunnel, and that replies are delivered
+// only to the originating client (not cross-delivered).
+func TestUDPServerIsolatesTunnelsPerClient(t *testing.T) {
+	d := &perClientUDPDialer{}
+	srv := NewUDPServer(d, []serverlist.Node{{Protocol: "masque", Supported: true}})
+	a, e := srv.Listen("127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer srv.Close()
+	udpAddr := a.(*net.UDPAddr)
+
+	// Build a SOCKS5 UDP frame targeting port 53.
+	makeFrame := func(payload string) []byte {
+		frame := []byte{0, 0, 0, 3, 11}
+		frame = append(frame, "dns.example"...)
+		frame = append(frame, 0x00, 0x35) // port 53
+		return append(frame, payload...)
+	}
+
+	cli1, e := net.DialUDP("udp4", nil, udpAddr)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer cli1.Close()
+
+	cli2, e := net.DialUDP("udp4", nil, udpAddr)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer cli2.Close()
+
+	// Client 1 sends first.
+	if _, e = cli1.Write(makeFrame("from-client1")); e != nil {
+		t.Fatal(e)
+	}
+	// Give the server time to open the first tunnel.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.count() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Client 2 sends to the same destination — must create a second tunnel.
+	if _, e = cli2.Write(makeFrame("from-client2")); e != nil {
+		t.Fatal(e)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.count() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if d.count() != 2 {
+		t.Fatalf("expected 2 independent tunnels, got %d", d.count())
+	}
+
+	// Send a reply on tunnel 0 — it must arrive only at client 1.
+	d.get(0).conns <- []byte("reply-to-client1")
+	buf := make([]byte, 512)
+	_ = cli1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := cli1.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("client1 read reply: %v", err)
+	}
+	if n < len("reply-to-client1") || string(buf[n-len("reply-to-client1"):n]) != "reply-to-client1" {
+		t.Fatalf("client1 got wrong reply: %q", buf[:n])
+	}
+
+	// Send a reply on tunnel 1 — it must arrive only at client 2.
+	d.get(1).conns <- []byte("reply-to-client2")
+	_ = cli2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err = cli2.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("client2 read reply: %v", err)
+	}
+	if n < len("reply-to-client2") || string(buf[n-len("reply-to-client2"):n]) != "reply-to-client2" {
+		t.Fatalf("client2 got wrong reply: %q", buf[:n])
+	}
+}
 // verifies the payload is forwarded to the MASQUE tunnel and the reply is
 // framed back to the client.
 func TestUDPServerRelaysSOCKS5Frames(t *testing.T) {

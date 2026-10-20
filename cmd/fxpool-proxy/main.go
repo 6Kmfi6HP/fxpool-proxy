@@ -478,6 +478,15 @@ func cmdRun(c *config) int {
 		}
 		masqueNodes = append(masqueNodes, mn)
 	}
+	// Also collect MASQUE nodes that arrived from Remote Settings. These have
+	// Protocol=="masque" and a TemplateString, but are excluded from the TCP
+	// node list (which only drives HTTP CONNECT). Without this, fetched MASQUE
+	// nodes are silently ignored and the UDP relay never starts.
+	for _, n := range nodes {
+		if n.Protocol == "masque" && n.TemplateString != "" {
+			masqueNodes = append(masqueNodes, n)
+		}
+	}
 	if len(nodes) == 0 && len(masqueNodes) == 0 {
 		safeError(errors.New("no usable nodes selected"))
 		return 1

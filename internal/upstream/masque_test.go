@@ -157,6 +157,118 @@ func TestMASQUEUDPEndToEnd(t *testing.T) {
 	}
 }
 
+// TestIsMASQUEAuthError only treats 401/403/407 as auth errors; network and
+// template failures must not trigger a token refresh.
+func TestIsMASQUEAuthError(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{"upstream MASQUE HTTP 401", true},
+		{"upstream MASQUE HTTP 403", true},
+		{"upstream MASQUE HTTP 407", true},
+		{"upstream MASQUE HTTP 500", false},
+		{"upstream MASQUE HTTP 200", false},
+		{"dial udp: no route to host", false},
+		{"masque: invalid URI template: parse error", false},
+		{"context deadline exceeded", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		var err error
+		if c.msg != "" {
+			err = errors.New(c.msg)
+		}
+		if got := isMASQUEAuthError(err); got != c.want {
+			t.Errorf("isMASQUEAuthError(%q) = %v, want %v", c.msg, got, c.want)
+		}
+	}
+}
+
+// TestMasqueEndpoint validates the proxy host/port resolution for both
+// Remote Settings nodes (MasqueHost/MasquePort set) and manually supplied
+// URI templates (authority parsed from TemplateString).
+func TestMasqueEndpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		node     serverlist.Node
+		wantHost string
+		wantPort int
+		wantErr  bool
+	}{
+		{
+			name:     "remote settings node with MasqueHost and MasquePort",
+			node:     serverlist.Node{MasqueHost: "proxy.example.com", MasquePort: 8443, TemplateString: "https://other.example.com/.well-known/masque/udp/{target_host}/{target_port}/"},
+			wantHost: "proxy.example.com", wantPort: 8443,
+		},
+		{
+			name:     "manual URI template with explicit port",
+			node:     serverlist.Node{TemplateString: "https://127.0.0.1:9999/.well-known/masque/udp/{target_host}/{target_port}/"},
+			wantHost: "127.0.0.1", wantPort: 9999,
+		},
+		{
+			name:     "manual URI template without port defaults to 443",
+			node:     serverlist.Node{TemplateString: "https://proxy.example.com/.well-known/masque/udp/{target_host}/{target_port}/"},
+			wantHost: "proxy.example.com", wantPort: 443,
+		},
+		{
+			name:    "no template and no MasqueHost returns error",
+			node:    serverlist.Node{},
+			wantErr: true,
+		},
+		{
+			name:    "MasqueHost set but MasquePort zero falls back to template parse",
+			node:    serverlist.Node{MasqueHost: "proxy.example.com", MasquePort: 0, TemplateString: "https://proxy.example.com:1234/.well-known/masque/udp/{target_host}/{target_port}/"},
+			wantHost: "proxy.example.com", wantPort: 1234,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h, p, err := masqueEndpoint(c.node)
+			if c.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if h != c.wantHost || p != c.wantPort {
+				t.Errorf("masqueEndpoint() = (%q, %d), want (%q, %d)", h, p, c.wantHost, c.wantPort)
+			}
+		})
+	}
+}
+
+// TestOpenUDPNoTokenRefreshOnNetworkError verifies that a non-auth failure
+// (network error, bad template) does not trigger a token refresh.
+func TestOpenUDPNoTokenRefreshOnNetworkError(t *testing.T) {
+	rejectCalled := false
+	ts := &trackingToken{rejectFn: func() { rejectCalled = true }}
+	d := &Dialer{Tokens: ts}
+	// Node with no TemplateString will fail at the template-missing check,
+	// which is not an auth error.
+	node := serverlist.Node{Protocol: "masque", Supported: true, TemplateString: ""}
+	_, err := d.OpenUDP(context.Background(), node, "example.com", 80)
+	if err == nil {
+		t.Fatal("expected error for missing template")
+	}
+	if rejectCalled {
+		t.Error("Reject was called for a non-auth error; it must not be")
+	}
+}
+
+type trackingToken struct{ rejectFn func() }
+
+func (s *trackingToken) Ensure(context.Context, bool) (string, error) { return "tok", nil }
+func (s *trackingToken) Reject(string) error {
+	if s.rejectFn != nil {
+		s.rejectFn()
+	}
+	return nil
+}
+
 // TestOpenDispatchRejectsUnknownProtocol ensures the TCP gate still fail-closes.
 func TestOpenDispatchRejectsUnknownProtocol(t *testing.T) {
 	d := &Dialer{Tokens: stubToken{}}

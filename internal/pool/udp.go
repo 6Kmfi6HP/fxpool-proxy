@@ -21,8 +21,9 @@ type UDPDialer interface {
 //
 //	RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT DATA
 //
-// A per-destination CONNECT-UDP tunnel is opened on demand. Replies are framed
-// with the SOCKS5 UDP header of the destination and sent back to the client.
+// A per-(client, destination) CONNECT-UDP tunnel is opened on demand. Replies
+// are framed with the SOCKS5 UDP header of the destination and sent back to
+// the originating client address.
 type UDPServer struct {
 	Dialer  UDPDialer
 	Nodes   []serverlist.Node
@@ -30,7 +31,7 @@ type UDPServer struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	mu      sync.Mutex
-	tunnels map[string]net.PacketConn
+	tunnels map[string]net.PacketConn // key: client|destination
 	wg      sync.WaitGroup
 }
 
@@ -93,7 +94,11 @@ func (s *UDPServer) handlePacket(pkt []byte, raddr net.Addr) {
 		return
 	}
 	payload := rest[addrLen:]
-	key := net.JoinHostPort(host, strconv.Itoa(port))
+	destKey := net.JoinHostPort(host, strconv.Itoa(port))
+	// Include the client address so two clients sending to the same destination
+	// get independent tunnels and independent reply routing. Sharing one tunnel
+	// would lose the first client's raddr and misdeliver replies to later clients.
+	key := raddr.String() + "|" + destKey
 
 	s.mu.Lock()
 	t, ok := s.tunnels[key]
@@ -114,7 +119,7 @@ func (s *UDPServer) handlePacket(pkt []byte, raddr net.Addr) {
 		t = tunnel
 		s.tunnels[key] = t
 		s.wg.Add(1)
-		go s.relayBack(key, t, raddr)
+		go s.relayBack(key, t, raddr, destKey)
 	}
 	s.mu.Unlock()
 
@@ -124,8 +129,10 @@ func (s *UDPServer) handlePacket(pkt []byte, raddr net.Addr) {
 }
 
 // relayBack reads datagrams from the tunnel and returns them to the client,
-// framed with the destination's SOCKS5 UDP header.
-func (s *UDPServer) relayBack(key string, t net.PacketConn, raddr net.Addr) {
+// framed with the destination's SOCKS5 UDP header. raddr is the originating
+// client address captured when the tunnel was created; destKey is the
+// host:port used to frame the SOCKS5 reply header.
+func (s *UDPServer) relayBack(key string, t net.PacketConn, raddr net.Addr, destKey string) {
 	defer s.wg.Done()
 	defer s.dropTunnel(key, t)
 	buf := make([]byte, 64<<10)
@@ -134,7 +141,7 @@ func (s *UDPServer) relayBack(key string, t net.PacketConn, raddr net.Addr) {
 		if e != nil {
 			return
 		}
-		framed := dSOCKSHeader(buf[:n], key)
+		framed := dSOCKSHeader(buf[:n], destKey)
 		if s.conn == nil {
 			return
 		}

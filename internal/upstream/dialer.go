@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -142,6 +143,34 @@ func (d *Dialer) connectOnce(ctx context.Context, node serverlist.Node, targetHo
 	return &bufferedConn{conn, br}, 200, nil
 }
 
+// masqueEndpoint returns the QUIC host and port to dial for the MASQUE proxy.
+// For Remote Settings nodes, MasqueHost/MasquePort hold the proxy endpoint
+// (which may differ from the general Hostname/Port). For manually supplied
+// templates, the authority is parsed from the template URI itself.
+func masqueEndpoint(node serverlist.Node) (host string, port int, err error) {
+	if node.MasqueHost != "" && node.MasquePort > 0 {
+		return node.MasqueHost, node.MasquePort, nil
+	}
+	// Fall back to parsing the authority from the URI template.
+	if node.TemplateString == "" {
+		return "", 0, errors.New("masque node has no templateString or MasqueHost")
+	}
+	u, e := url.Parse(node.TemplateString)
+	if e != nil || u.Host == "" {
+		return "", 0, fmt.Errorf("masque: cannot derive endpoint from templateString %q", node.TemplateString)
+	}
+	h, p, e := net.SplitHostPort(u.Host)
+	if e != nil {
+		// No port in host; default to 443 for https.
+		return strings.ToLower(u.Host), 443, nil
+	}
+	pp, e := strconv.Atoi(p)
+	if e != nil || pp < 1 || pp > 65535 {
+		return "", 0, fmt.Errorf("masque: invalid port in templateString: %q", p)
+	}
+	return strings.ToLower(h), pp, nil
+}
+
 // openMASQUE establishes an HTTP/3 CONNECT-UDP (RFC 9298) tunnel to the target
 // through the node's MASQUE proxy. Each call opens a fresh QUIC connection to
 // the proxy and a single CONNECT-UDP stream. The returned net.PacketConn
@@ -161,14 +190,20 @@ func (d *Dialer) openMASQUE(ctx context.Context, node serverlist.Node, targetHos
 	req.Header().Set("Proxy-Authorization", "Bearer "+token)
 	req.Header().Set("User-Agent", "firefox-ip-protection-pool/3.0")
 
+	proxyHost, proxyPort, e := masqueEndpoint(node)
+	if e != nil {
+		return nil, e
+	}
+	proxyAddr := authority(proxyHost, proxyPort)
+
 	tlsConf := d.MasqueTLSConfig
 	if tlsConf == nil {
 		tlsConf = &tls.Config{NextProtos: []string{http3.NextProtoH3}}
 	} else {
 		tlsConf = tlsConf.Clone()
 	}
-	if tlsConf.ServerName == "" && node.MasqueHost != "" {
-		tlsConf.ServerName = node.MasqueHost
+	if tlsConf.ServerName == "" {
+		tlsConf.ServerName = proxyHost
 	}
 	quicConf := d.MasqueQUICConfig
 	if quicConf == nil {
@@ -179,7 +214,17 @@ func (d *Dialer) openMASQUE(ctx context.Context, node serverlist.Node, targetHos
 	} else if !quicConf.EnableDatagrams {
 		return nil, errors.New("masque: QUICConfig must enable datagrams")
 	}
-	tr := &masque.Transport{TLSClientConfig: tlsConf, QUICConfig: quicConf}
+	// Pin the transport to the resolved proxy endpoint via DialAddr so that the
+	// QUIC connection goes to the correct host:port regardless of what the URI
+	// template's authority says (Remote Settings nodes where MasqueHost/MasquePort
+	// differ from Hostname/Port, or manually supplied templates with no port).
+	tr := &masque.Transport{
+		TLSClientConfig: tlsConf,
+		QUICConfig:      quicConf,
+		DialAddr: func(ctx context.Context, _ string, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
+			return quic.DialAddr(ctx, proxyAddr, tlsCfg, quicCfg)
+		},
+	}
 	conn, resp, e := tr.Dial(req)
 	if e != nil {
 		return nil, e
@@ -189,6 +234,20 @@ func (d *Dialer) openMASQUE(ctx context.Context, node serverlist.Node, targetHos
 		return nil, fmt.Errorf("upstream MASQUE HTTP %d", resp.StatusCode)
 	}
 	return conn, nil
+}
+
+// isMASQUEAuthError reports whether err came from an HTTP 401, 403, or 407
+// response during a MASQUE dial. Only these statuses indicate a bad or expired
+// token; all other failures (DNS, network, unsupported template) are not
+// auth-related and must not trigger a credential refresh.
+func isMASQUEAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "MASQUE HTTP 401") ||
+		strings.Contains(s, "MASQUE HTTP 403") ||
+		strings.Contains(s, "MASQUE HTTP 407")
 }
 
 // OpenUDP dials a UDP tunnel to the target. Only MASQUE nodes support UDP;
@@ -204,6 +263,13 @@ func (d *Dialer) OpenUDP(ctx context.Context, node serverlist.Node, targetHost s
 	c, e := d.openMASQUE(ctx, node, targetHost, targetPort, token)
 	if e == nil {
 		return c, nil
+	}
+	// Only refresh credentials for authentication failures. DNS errors, network
+	// timeouts, invalid templates, and unsupported server responses are not
+	// auth-related; retrying with a new token there would reject a valid token
+	// and cause unnecessary account refreshes on every new destination.
+	if !isMASQUEAuthError(e) {
+		return nil, e
 	}
 	_ = d.Tokens.Reject(token)
 	token, e = d.Tokens.Ensure(ctx, true)
