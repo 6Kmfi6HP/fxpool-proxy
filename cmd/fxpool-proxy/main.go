@@ -20,11 +20,13 @@ import (
 	"syscall"
 	"time"
 
+	"fxpool-proxy/internal/accounts"
 	"fxpool-proxy/internal/fxa"
 	"fxpool-proxy/internal/fxaexport"
 	"fxpool-proxy/internal/pool"
 	"fxpool-proxy/internal/securefile"
 	"fxpool-proxy/internal/serverlist"
+	storepkg "fxpool-proxy/internal/store"
 	"fxpool-proxy/internal/token"
 	"fxpool-proxy/internal/upstream"
 
@@ -37,6 +39,7 @@ var version = "dev"
 type config struct {
 	root, guardian, serverURL, proxyPass, fxaToken, bind, advertise, rotator, httpRotator, rotateMode, countries, country, authUser, authPass, firefoxVersion, clientCountry, masqueURI string
 	fxaBase                                                                                                                                                                             string
+	accountMode                                                                                                                                                                         string
 	socksBase, httpBase, udpBase, limit                                                                                                                                                 int
 	forceSync, allowNoToken, noSocks, noHTTP, requireAuth, allowOpen, includeLocked, recommended                                                                                        bool
 }
@@ -91,15 +94,27 @@ func flagsFor(name string) (*flag.FlagSet, *config) {
 	f.StringVar(&c.masqueURI, "masque-uri", env("MASQUE_URI", ""), "MASQUE proxy URI template, e.g. https://host:443/.well-known/masque/udp/{target_host}/{target_port}/")
 	f.BoolVar(&c.includeLocked, "include-locked", false, "include locked records diagnostically")
 	f.BoolVar(&c.recommended, "recommended", false, "use REC records only")
+	f.StringVar(&c.accountMode, "account-mode", env("ACCOUNT_MODE", ""), "multi-account token selection mode (rr)")
 	return f, c
 }
 func main() { os.Exit(run(os.Args[1:])) }
 func run(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: fxpool-proxy <sync|token-status|token-refresh|usage|how-to-token|probe|run|login|export-credentials|import-credentials>")
+		fmt.Fprintln(os.Stderr, "usage: fxpool-proxy <sync|token-status|token-refresh|usage|how-to-token|probe|run|login|export-credentials|import-credentials|accounts>")
 		return 2
 	}
 	cmd := argv[0]
+	// "accounts" is a sub-command family with its own argument parsing.
+	if cmd == "accounts" {
+		f, c := flagsFor(cmd)
+		_ = f.Parse(argv[1:])
+		subArgs := f.Args()
+		if err := token.EnsureDirs(c.root); err != nil {
+			safeError(err)
+			return 1
+		}
+		return cmdAccounts(c, subArgs)
+	}
 	f, c := flagsFor(cmd)
 	force := false
 	deleteSource, noVerify := false, false
@@ -206,6 +221,69 @@ func manager(c *config) *token.Manager {
 	m.AccessToken = strings.TrimSpace(c.fxaToken)
 	return m
 }
+
+// openAccountDB opens the account database, runs schema migration, and
+// performs the one-time legacy import.  Returns the open DB; caller must
+// Close() it.  On any error the function prints a diagnostic and the caller
+// should return 1.
+func openAccountDB(c *config) (*storepkg.DB, error) {
+	db, err := storepkg.Open(c.root)
+	if err != nil {
+		return nil, fmt.Errorf("open account database: %w", err)
+	}
+	ctx := context.Background()
+	res, err := db.LegacyImport(ctx, c.root)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("legacy credential import: %w", err)
+	}
+	if res.AccountImported {
+		fmt.Fprintf(os.Stderr, "[+] migrated legacy credentials uid=%s\n", res.UID)
+	} else if !res.Skipped && res.Diagnostics != "" {
+		fmt.Fprintf(os.Stderr, "[*] legacy import: %s\n", res.Diagnostics)
+	}
+	return db, nil
+}
+
+// managerWithDB creates a DB-backed Manager for the given account UID.
+// When uid is empty and exactly one account exists, that account is used.
+func managerWithDB(c *config, db *storepkg.DB, uid string) (*token.Manager, int64, error) {
+	ctx := context.Background()
+	accounts, err := db.ListAccounts(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	var acc storepkg.Account
+	switch {
+	case uid != "":
+		found := false
+		for _, a := range accounts {
+			if a.UID == uid {
+				acc = a
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, 0, fmt.Errorf("account %q not found", uid)
+		}
+	case len(accounts) == 1:
+		acc = accounts[0]
+	case len(accounts) == 0:
+		return nil, 0, errors.New("no accounts in database; import credentials first")
+	default:
+		return nil, 0, errors.New("multiple accounts present; specify --uid")
+	}
+	m := token.NewManager(c.root, c.guardian)
+	if c.fxaBase != "" {
+		m.FxAAuth = strings.TrimRight(c.fxaBase, "/")
+	}
+	m.ExplicitProxyPass = strings.TrimSpace(c.proxyPass)
+	m.AccessToken = strings.TrimSpace(c.fxaToken)
+	m.Store = &storepkg.ManagerBackend{DB: db, AccountID: acc.ID}
+	m.AccountID = acc.ID
+	return m, acc.ID, nil
+}
 func store(c *config) serverlist.Store { return serverlist.DefaultStore(c.root, c.serverURL) }
 func cmdSync(c *config) int {
 	nodes, e := store(c).Fetch(context.Background(), true, c.firefoxVersion, c.clientCountry, c.includeLocked)
@@ -237,6 +315,76 @@ func cmdSync(c *config) int {
 	return 0
 }
 func cmdStatus(c *config) int {
+	if c.accountMode != "" {
+		db, err := openAccountDB(c)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		defer db.Close()
+		ctx := context.Background()
+		accs, err := db.ListAccounts(ctx)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		// Single account: emit the legacy-compatible JSON schema.
+		if len(accs) == 1 {
+			acc := accs[0]
+			rs, _ := db.GetRefreshState(ctx, acc.ID)
+			state := token.RefreshState{
+				Schema:              1,
+				Result:              rs.Result,
+				ConsecutiveFailures: rs.ConsecutiveFailures,
+				Generation:          rs.Generation,
+			}
+			if rs.LastAttemptAt != nil {
+				v := float64(rs.LastAttemptAt.Unix())
+				state.LastAttemptAt = &v
+			}
+			if rs.LastSuccessAt != nil {
+				v := float64(rs.LastSuccessAt.Unix())
+				state.LastSuccessAt = &v
+			}
+			if rs.NextAttemptAt != nil {
+				v := float64(rs.NextAttemptAt.Unix())
+				state.NextAttemptAt = &v
+			}
+			if rs.ProxyPassExpiresAt != nil {
+				v := float64(rs.ProxyPassExpiresAt.Unix())
+				state.ProxyPassExpiresAt = &v
+			}
+			if rs.HTTPStatus != nil {
+				v := *rs.HTTPStatus
+				state.HTTPStatus = &v
+			}
+			pp, ppErr := db.GetProxyPass(ctx, acc.ID)
+			out := map[string]any{
+				"automatic_renewal_ready": acc.Enabled,
+				"has_proxy_pass":          ppErr == nil,
+				"guardian":                c.guardian,
+				"refresh_state":           state,
+			}
+			if ppErr == nil {
+				claims, _ := token.DecodeAndValidateJWT(pp.JWT, c.guardian, time.Now(), 0)
+				out["proxy_pass"] = map[string]any{
+					"valid": true, "seconds_left": int64(claims.Expires) - time.Now().Unix(),
+					"algorithm_verified": false, "signature_verified": false,
+				}
+			}
+			printJSON(out)
+			return 0
+		}
+		// Multiple accounts: use accounts list format.
+		p, err := accounts.NewPool(ctx, db, c.root, c.guardian, c.fxaBase, nil)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		statuses, _ := p.ListStatuses(ctx)
+		printJSON(statuses)
+		return 0
+	}
 	m := manager(c)
 	state := token.LoadState(filepath.Join(c.root, "tokens", "refresh_state.json"))
 	_, credErr := m.LoadCredentials()
@@ -250,6 +398,28 @@ func cmdStatus(c *config) int {
 	return 0
 }
 func cmdRefresh(c *config, force bool) int {
+	if c.accountMode != "" {
+		db, err := openAccountDB(c)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		defer db.Close()
+		ctx := context.Background()
+		m, _, err := managerWithDB(c, db, "")
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		t, e := m.Refresh(ctx, force)
+		if e != nil {
+			safeError(e)
+			return 1
+		}
+		claims, _ := token.DecodeAndValidateJWT(t, c.guardian, time.Now(), 0)
+		fmt.Printf("[+] refreshed; seconds_left=%d\n", int64(claims.Expires)-time.Now().Unix())
+		return 0
+	}
 	t, e := manager(c).Refresh(context.Background(), force)
 	if e != nil {
 		safeError(e)
@@ -510,10 +680,6 @@ func cmdRun(c *config) int {
 		}
 		masqueNodes = append(masqueNodes, mn)
 	}
-	// Also collect MASQUE nodes that arrived from Remote Settings. These have
-	// Protocol=="masque" and a TemplateString, but are excluded from the TCP
-	// node list (which only drives HTTP CONNECT). Without this, fetched MASQUE
-	// nodes are silently ignored and the UDP relay never starts.
 	for _, n := range nodes {
 		if n.Protocol == "masque" && n.TemplateString != "" {
 			masqueNodes = append(masqueNodes, n)
@@ -523,12 +689,49 @@ func cmdRun(c *config) int {
 		safeError(errors.New("no usable nodes selected"))
 		return 1
 	}
-	m := manager(c)
-	if _, e = m.Ensure(context.Background(), false); e != nil && !c.allowNoToken {
-		safeError(e)
-		return 1
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var tokenSource upstream.TokenSource
+	if c.accountMode != "" && strings.TrimSpace(c.proxyPass) == "" {
+		// Multi-account mode: open DB and build a Pool.
+		// When FXPOOL_PROXY_PASS_JWT is set it is a hard priority: bypass the
+		// account pool and use the single-account Manager path below, which
+		// already handles ExplicitProxyPass and the per-file reject list.
+		db, err := openAccountDB(c)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		defer db.Close()
+		p, err := accounts.NewPool(ctx, db, c.root, c.guardian, c.fxaBase, nil)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		if p.Len() == 0 && !c.allowNoToken {
+			safeError(errors.New("no enabled accounts in pool; import credentials first"))
+			return 1
+		}
+		if _, e := p.Ensure(ctx, false); e != nil && !c.allowNoToken {
+			safeError(e)
+			return 1
+		}
+		tokenSource = p
+		go refreshLoopPool(ctx, p)
+	} else {
+		// Single-account mode (or explicit JWT override): legacy file-backed Manager.
+		m := manager(c)
+		if _, e = m.Ensure(ctx, false); e != nil && !c.allowNoToken {
+			safeError(e)
+			return 1
+		}
+		tokenSource = m
+		go refreshLoop(ctx, m)
 	}
-	dial := &upstream.Dialer{Tokens: m}
+
+	dial := &upstream.Dialer{Tokens: tokenSource}
 	ports, e := pool.AssignPorts(filepath.Join(c.root, "data", "port-map.json"), nodes, c.socksBase, c.httpBase)
 	if e != nil {
 		safeError(e)
@@ -608,9 +811,6 @@ func cmdRun(c *config) int {
 		fmt.Printf("[*] UDP relay (SOCKS5 UDP ASSOCIATE via MASQUE): %s\n", udpAddr)
 	}
 	fmt.Printf("[*] pool running: nodes=%d (credentials omitted)\n", len(eps))
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go refreshLoop(ctx, m)
 	<-ctx.Done()
 	fmt.Println("[*] stopping")
 	return 0
@@ -786,6 +986,19 @@ func refreshLoop(ctx context.Context, m *token.Manager) {
 		}
 	}
 }
+
+func refreshLoopPool(ctx context.Context, p *accounts.Pool) {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.RefreshAll(ctx)
+		}
+	}
+}
 func cmdImport(c *config, path string, deleteSource, noVerify bool) int {
 	if path == "" {
 		safeError(errors.New("credential bundle path is required"))
@@ -816,14 +1029,44 @@ func cmdImport(c *config, path string, deleteSource, noVerify bool) int {
 		return 2
 	}
 	cred := token.Credentials{Schema: 1, Email: in.Email, UID: strings.ToLower(in.UID), SessionToken: strings.ToLower(in.SessionToken)}
-	if e = manager(c).PublishCredentials(cred); e != nil {
-		safeError(e)
-		return 1
-	}
-	if !noVerify {
-		if _, e = manager(c).Refresh(context.Background(), true); e != nil {
-			safeError(errors.New("credentials imported but verification failed; source kept"))
+
+	if c.accountMode != "" {
+		db, err := openAccountDB(c)
+		if err != nil {
+			safeError(err)
 			return 1
+		}
+		defer db.Close()
+		m, _, err := managerWithDB(c, db, "")
+		if err != nil {
+			// First import: no account yet. Use a bare DB-backed manager.
+			bk := &storepkg.ManagerBackend{DB: db, AccountID: 0}
+			m = token.NewManager(c.root, c.guardian)
+			if c.fxaBase != "" {
+				m.FxAAuth = strings.TrimRight(c.fxaBase, "/")
+			}
+			m.Store = bk
+		}
+		if e = m.PublishCredentials(cred); e != nil {
+			safeError(e)
+			return 1
+		}
+		if !noVerify {
+			if _, e = m.Refresh(context.Background(), true); e != nil {
+				safeError(errors.New("credentials imported but verification failed; source kept"))
+				return 1
+			}
+		}
+	} else {
+		if e = manager(c).PublishCredentials(cred); e != nil {
+			safeError(e)
+			return 1
+		}
+		if !noVerify {
+			if _, e = manager(c).Refresh(context.Background(), true); e != nil {
+				safeError(errors.New("credentials imported but verification failed; source kept"))
+				return 1
+			}
 		}
 	}
 	if deleteSource && path != "-" {
@@ -834,6 +1077,121 @@ func cmdImport(c *config, path string, deleteSource, noVerify bool) int {
 	}
 	fmt.Println("[+] Firefox renewal credentials imported successfully")
 	return 0
+}
+
+// cmdAccounts handles the "accounts" sub-command family:
+// accounts list|enable|disable|remove
+func cmdAccounts(c *config, subArgs []string) int {
+	if len(subArgs) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: fxpool-proxy accounts <list|enable|disable|remove>")
+		return 2
+	}
+	db, err := openAccountDB(c)
+	if err != nil {
+		safeError(err)
+		return 1
+	}
+	defer db.Close()
+	ctx := context.Background()
+	sub := subArgs[0]
+	rest := subArgs[1:]
+
+	switch sub {
+	case "list":
+		listJSON := false
+		sf := flag.NewFlagSet("accounts list", flag.ContinueOnError)
+		sf.BoolVar(&listJSON, "json", false, "output JSON")
+		_ = sf.Parse(rest)
+		accs, err := db.ListAccounts(ctx)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		if listJSON {
+			type row struct {
+				UID     string `json:"uid"`
+				Email   string `json:"email"`
+				Enabled bool   `json:"enabled"`
+				Result  string `json:"refresh_result"`
+				Label   string `json:"label"`
+			}
+			var rows []row
+			for _, a := range accs {
+				rs, _ := db.GetRefreshState(ctx, a.ID)
+				rows = append(rows, row{a.UID, a.Email, a.Enabled, rs.Result, a.Label})
+			}
+			printJSON(rows)
+			return 0
+		}
+		for _, a := range accs {
+			rs, _ := db.GetRefreshState(ctx, a.ID)
+			pp, ppErr := db.GetProxyPass(ctx, a.ID)
+			ttl := ""
+			if ppErr == nil {
+				secs := time.Until(pp.ExpiresAt).Seconds()
+				if secs > 0 {
+					ttl = fmt.Sprintf("ttl=%ds", int64(secs))
+				} else {
+					ttl = "expired"
+				}
+			}
+			enabled := "enabled"
+			if !a.Enabled {
+				enabled = "disabled"
+			}
+			fmt.Printf("uid=%-32s %s  state=%-20s %s\n", a.UID, enabled, rs.Result, ttl)
+		}
+		return 0
+
+	case "enable", "disable":
+		if len(rest) == 0 {
+			fmt.Fprintf(os.Stderr, "usage: accounts %s <uid>\n", sub)
+			return 2
+		}
+		uid := rest[0]
+		if err := db.SetAccountEnabled(ctx, uid, sub == "enable"); err != nil {
+			safeError(err)
+			return 1
+		}
+		fmt.Printf("[+] account %s %sd\n", uid, sub)
+		return 0
+
+	case "remove":
+		yes := false
+		sf := flag.NewFlagSet("accounts remove", flag.ContinueOnError)
+		sf.BoolVar(&yes, "yes", false, "confirm deletion")
+		_ = sf.Parse(rest)
+		args := sf.Args()
+		if len(args) == 0 {
+			fmt.Fprintln(os.Stderr, "usage: accounts remove --yes <uid>")
+			return 2
+		}
+		if !yes {
+			fmt.Fprintln(os.Stderr, "[!] pass --yes to confirm deletion of account and all its data")
+			return 2
+		}
+		uid := args[0]
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		if err := db.DeleteAccount(ctx, tx, uid); err != nil {
+			_ = tx.Rollback()
+			safeError(err)
+			return 1
+		}
+		if err := tx.Commit(); err != nil {
+			safeError(err)
+			return 1
+		}
+		fmt.Printf("[+] account %s removed\n", uid)
+		return 0
+
+	default:
+		fmt.Fprintln(os.Stderr, "unknown accounts sub-command:", sub)
+		return 2
+	}
 }
 func safeError(e error) { fmt.Fprintf(os.Stderr, "[!] %s\n", e.Error()) }
 func printJSON(v any)   { b, _ := json.MarshalIndent(v, "", "  "); fmt.Println(string(b)) }

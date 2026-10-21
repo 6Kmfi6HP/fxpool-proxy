@@ -40,6 +40,40 @@ type Manager struct {
 	ExplicitProxyPass, AccessToken    string
 	mu                                sync.Mutex
 	refreshing                        bool
+	// Store, when non-nil, makes the Manager read and write account data
+	// through the database instead of the legacy file paths. AccountID
+	// identifies the row in the accounts table. When Store is nil the
+	// Manager falls back to file-based storage (legacy single-account mode).
+	Store     StoreBackend
+	AccountID int64
+}
+
+// StoreBackend abstracts the database operations a DB-bound Manager needs.
+// The concrete implementation lives in internal/store; the interface breaks
+// the import cycle (store imports token for legacy migration, so token
+// cannot import store). Methods use context.Background internally.
+type StoreBackend interface {
+	// LoadCredentials returns the renewal credentials for the account.
+	LoadCredentials(accountID int64) (Credentials, error)
+	// ReadToken returns the stored raw ProxyPass JWT. An empty string with
+	// a nil error means no token is currently stored.
+	ReadToken(accountID int64) (string, error)
+	// SaveToken persists a raw JWT with its expiry and fetch timestamps.
+	SaveToken(accountID int64, jwt string, expiresAt, fetchedAt time.Time) error
+	// LoadState returns the current refresh state for the account.
+	LoadState(accountID int64) (RefreshState, error)
+	// SaveState persists a refresh state row for the account.
+	SaveState(accountID int64, rs RefreshState) error
+	// IsRejected reports whether the digest is in the rejected list.
+	IsRejected(digest string) (bool, error)
+	// Reject adds a digest to the rejected list for the account, pruning
+	// entries beyond the per-account cap.
+	Reject(accountID int64, digest string) error
+	// PublishCredentials upserts the account by UID and resets its token
+	// and state in a single transaction. It returns the resulting account
+	// ID (which may differ from the Manager's current AccountID on first
+	// import).
+	PublishCredentials(c Credentials) (int64, error)
 }
 type Usage struct {
 	Unlimited  *bool  `json:"unlimited"`
@@ -135,6 +169,15 @@ func (m *Manager) Login(ctx context.Context, email, password string, opts ...fun
 }
 func (m *Manager) tokenPath() string { return filepath.Join(m.Root, "tokens", "proxy_pass.jwt") }
 func (m *Manager) statePath() string { return filepath.Join(m.Root, "tokens", "refresh_state.json") }
+
+// loadCreds returns the renewal credentials, from the DB when a Store is
+// bound, otherwise from the legacy file.
+func (m *Manager) loadCreds() (Credentials, error) {
+	if m.Store != nil {
+		return m.Store.LoadCredentials(m.AccountID)
+	}
+	return m.LoadCredentials()
+}
 func (m *Manager) LoadCredentials() (Credentials, error) {
 	path := filepath.Join(m.Root, "tokens", "renewal_credentials.json")
 	b, e := securefile.ReadRegular(path, 16<<10, true)
@@ -155,26 +198,103 @@ func (m *Manager) LoadCredentials() (Credentials, error) {
 	c.SessionToken = strings.ToLower(c.SessionToken)
 	return c, nil
 }
+
+// loadState returns the current refresh state, from the DB when a Store is
+// bound, otherwise from the legacy file.
+func (m *Manager) loadState() RefreshState {
+	if m.Store != nil {
+		s, err := m.Store.LoadState(m.AccountID)
+		if err == nil {
+			return s
+		}
+		return EmptyState()
+	}
+	return LoadState(m.statePath())
+}
+
+// saveState persists a refresh state row via the DB when a Store is bound,
+// otherwise writes the legacy file.
+func (m *Manager) saveState(result string, now time.Time, status *int, next, expiry *time.Time) (RefreshState, error) {
+	if m.Store != nil {
+		// Build the state by applying the same transition rules as
+		// RecordState, then persist it through the Store.
+		s := m.loadState()
+		n := float64(now.Unix())
+		s.Result = result
+		if result != "never" {
+			s.LastAttemptAt = &n
+		}
+		s.HTTPStatus = status
+		if next != nil {
+			v := float64(next.Unix())
+			s.NextAttemptAt = &v
+		} else {
+			s.NextAttemptAt = nil
+		}
+		if expiry != nil {
+			v := float64(expiry.Unix())
+			s.ProxyPassExpiresAt = &v
+		}
+		if result == "success" {
+			s.LastSuccessAt = &n
+			s.ConsecutiveFailures = 0
+			s.Generation++
+		} else if result == "fresh" || result == "credentials_imported" {
+			s.ConsecutiveFailures = 0
+		} else if failure(result) {
+			s.ConsecutiveFailures++
+		}
+		if !validResult(result) {
+			return s, os.ErrInvalid
+		}
+		return s, m.Store.SaveState(m.AccountID, s)
+	}
+	return RecordState(m.statePath(), result, now, status, next, expiry)
+}
+
 func (m *Manager) Current(minTTL time.Duration) (string, error) {
-	state := LoadState(m.statePath())
+	state := m.loadState()
 	switch state.Result {
 	case "credentials_imported", "rate_limited", "reauth_required", "no_entitlement":
 		return "", fmt.Errorf("new tunnels blocked by refresh state %s", state.Result)
 	}
-	b, e := securefile.ReadRegular(m.tokenPath(), 64<<10, true)
-	if e != nil {
-		if m.ExplicitProxyPass == "" {
+	var raw string
+	if m.Store != nil {
+		t, e := m.Store.ReadToken(m.AccountID)
+		if e != nil {
 			return "", e
 		}
-		b = []byte(m.ExplicitProxyPass)
+		raw = t
+		if raw == "" && m.ExplicitProxyPass == "" {
+			return "", errors.New("no proxy_pass stored")
+		}
+		if raw == "" {
+			raw = m.ExplicitProxyPass
+		}
+	} else {
+		b, e := securefile.ReadRegular(m.tokenPath(), 64<<10, true)
+		if e != nil {
+			if m.ExplicitProxyPass == "" {
+				return "", e
+			}
+			b = []byte(m.ExplicitProxyPass)
+		}
+		raw = strings.TrimSpace(string(b))
 	}
-	raw := strings.TrimSpace(string(b))
-	if _, e = DecodeAndValidateJWT(raw, m.Guardian, time.Now(), minTTL); e != nil {
+	raw = strings.TrimSpace(raw)
+	if _, e := DecodeAndValidateJWT(raw, m.Guardian, time.Now(), minTTL); e != nil {
 		return "", e
 	}
 	dig := sha256.Sum256([]byte(raw))
-	if rejected, _ := securefile.ReadRegular(filepath.Join(m.Root, "tokens", "rejected_proxy_pass.sha256"), 4096, false); bytes.Contains(rejected, []byte(hex.EncodeToString(dig[:]))) {
-		return "", errors.New("ProxyPass was rejected")
+	digest := hex.EncodeToString(dig[:])
+	if m.Store != nil {
+		if ok, _ := m.Store.IsRejected(digest); ok {
+			return "", errors.New("ProxyPass was rejected")
+		}
+	} else {
+		if rejected, _ := securefile.ReadRegular(filepath.Join(m.Root, "tokens", "rejected_proxy_pass.sha256"), 4096, false); bytes.Contains(rejected, []byte(digest)) {
+			return "", errors.New("ProxyPass was rejected")
+		}
 	}
 	return raw, nil
 }
@@ -200,21 +320,21 @@ func (m *Manager) Refresh(ctx context.Context, force bool) (string, error) {
 		return "", e
 	}
 	defer unlock(lock)
-	state := LoadState(m.statePath())
+	state := m.loadState()
 	now := time.Now()
 	if state.NextAttemptAt != nil && *state.NextAttemptAt > float64(now.Unix()) {
 		return "", errors.New("refresh deferred by persisted cooldown")
 	}
 	if !force {
 		if t, e := m.Current(120 * time.Second); e == nil {
-			_, _ = RecordState(m.statePath(), "fresh", now, nil, nil, nil)
+			_, _ = m.saveState("fresh", now, nil, nil, nil)
 			return t, nil
 		}
 	}
-	_, _ = RecordState(m.statePath(), "in_progress", now, nil, nil, nil)
+	_, _ = m.saveState("in_progress", now, nil, nil, nil)
 	access := m.AccessToken
 	if access == "" {
-		c, e := m.LoadCredentials()
+		c, e := m.loadCreds()
 		if e != nil {
 			return "", m.fail("missing_credentials", nil, e)
 		}
@@ -224,24 +344,31 @@ func (m *Manager) Refresh(ctx context.Context, force bool) (string, error) {
 		}
 		defer m.destroy(context.WithoutCancel(ctx), access)
 	}
-	token, e := m.guardianToken(ctx, access)
+	tok, e := m.guardianToken(ctx, access)
 	if e != nil {
 		return "", m.fail(classify(e), httpStatus(e), e)
 	}
-	claims, e := DecodeAndValidateJWT(token, m.Guardian, time.Now(), 120*time.Second)
+	claims, e := DecodeAndValidateJWT(tok, m.Guardian, time.Now(), 120*time.Second)
 	if e != nil {
 		return "", m.fail("protocol_error", nil, e)
 	}
-	if e = securefile.AtomicWrite(m.tokenPath(), []byte(token+"\n"), 0o600); e != nil {
-		return "", m.fail("transient_error", nil, e)
+	if m.Store != nil {
+		expiry := time.Unix(int64(claims.Expires), 0)
+		if e = m.Store.SaveToken(m.AccountID, tok, expiry, time.Now()); e != nil {
+			return "", m.fail("transient_error", nil, e)
+		}
+	} else {
+		if e = securefile.AtomicWrite(m.tokenPath(), []byte(tok+"\n"), 0o600); e != nil {
+			return "", m.fail("transient_error", nil, e)
+		}
 	}
 	expiry := time.Unix(int64(claims.Expires), 0)
 	status := 200
-	_, e = RecordState(m.statePath(), "success", time.Now(), &status, nil, &expiry)
-	return token, e
+	_, e = m.saveState("success", time.Now(), &status, nil, &expiry)
+	return tok, e
 }
 func (m *Manager) fail(result string, status *int, cause error) error {
-	s := LoadState(m.statePath())
+	s := m.loadState()
 	delay := Backoff(s.ConsecutiveFailures)
 	var he *httpError
 	if errors.As(cause, &he) && he.retry > 0 {
@@ -251,7 +378,7 @@ func (m *Manager) fail(result string, status *int, cause error) error {
 		delay = 5 * time.Minute
 	}
 	next := time.Now().Add(delay)
-	_, _ = RecordState(m.statePath(), result, time.Now(), status, &next, nil)
+	_, _ = m.saveState(result, time.Now(), status, &next, nil)
 	return fmt.Errorf("%s: %w", result, cause)
 }
 func (m *Manager) lock(block bool) (*os.File, error) {
@@ -435,6 +562,14 @@ func (m *Manager) PublishCredentials(c Credentials) error {
 	c.Schema = 1
 	c.UID = strings.ToLower(c.UID)
 	c.SessionToken = strings.ToLower(c.SessionToken)
+	if m.Store != nil {
+		newID, e := m.Store.PublishCredentials(c)
+		if e != nil {
+			return e
+		}
+		m.AccountID = newID
+		return nil
+	}
 	if e = securefile.AtomicJSON(filepath.Join(m.Root, "tokens", "renewal_credentials.json"), c, 0o600); e != nil {
 		return e
 	}
@@ -510,10 +645,13 @@ func (m *Manager) destroy(ctx context.Context, access string) {
 }
 func (m *Manager) Reject(raw string) error {
 	sum := sha256.Sum256([]byte(raw))
+	digest := hex.EncodeToString(sum[:])
+	if m.Store != nil {
+		return m.Store.Reject(m.AccountID, digest)
+	}
 	path := filepath.Join(m.Root, "tokens", "rejected_proxy_pass.sha256")
 	old, _ := securefile.ReadRegular(path, 4096, false)
 	lines := strings.Fields(string(old))
-	digest := hex.EncodeToString(sum[:])
 	for _, l := range lines {
 		if hmac.Equal([]byte(l), []byte(digest)) {
 			return nil
