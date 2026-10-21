@@ -253,6 +253,23 @@ func (m *Manager) saveState(result string, now time.Time, status *int, next, exp
 }
 
 func (m *Manager) Current(minTTL time.Duration) (string, error) {
+	// ExplicitProxyPass is a hard-priority source: when set it bypasses the
+	// stored token file, the DB, and the refresh-state block entirely.
+	// The caller is responsible for keeping the rejected list in sync via
+	// the file-backed rejected_proxy_pass.sha256 path (ExplicitSource rule,
+	// plan §4.1).
+	if m.ExplicitProxyPass != "" {
+		raw := strings.TrimSpace(m.ExplicitProxyPass)
+		if _, e := DecodeAndValidateJWT(raw, m.Guardian, time.Now(), minTTL); e != nil {
+			return "", e
+		}
+		dig := sha256.Sum256([]byte(raw))
+		digest := hex.EncodeToString(dig[:])
+		if rejected, _ := securefile.ReadRegular(filepath.Join(m.Root, "tokens", "rejected_proxy_pass.sha256"), 4096, false); bytes.Contains(rejected, []byte(digest)) {
+			return "", errors.New("explicit ProxyPass was rejected")
+		}
+		return raw, nil
+	}
 	state := m.loadState()
 	switch state.Result {
 	case "credentials_imported", "rate_limited", "reauth_required", "no_entitlement":
@@ -265,19 +282,13 @@ func (m *Manager) Current(minTTL time.Duration) (string, error) {
 			return "", e
 		}
 		raw = t
-		if raw == "" && m.ExplicitProxyPass == "" {
-			return "", errors.New("no proxy_pass stored")
-		}
 		if raw == "" {
-			raw = m.ExplicitProxyPass
+			return "", errors.New("no proxy_pass stored")
 		}
 	} else {
 		b, e := securefile.ReadRegular(m.tokenPath(), 64<<10, true)
 		if e != nil {
-			if m.ExplicitProxyPass == "" {
-				return "", e
-			}
-			b = []byte(m.ExplicitProxyPass)
+			return "", e
 		}
 		raw = strings.TrimSpace(string(b))
 	}
@@ -299,6 +310,11 @@ func (m *Manager) Current(minTTL time.Duration) (string, error) {
 	return raw, nil
 }
 func (m *Manager) Ensure(ctx context.Context, force bool) (string, error) {
+	// Explicit JWT: bypass refresh entirely; Current handles the hard-priority
+	// check and the rejected list, so Ensure just delegates to it.
+	if m.ExplicitProxyPass != "" {
+		return m.Current(120 * time.Second)
+	}
 	if !force {
 		if t, e := m.Current(120 * time.Second); e == nil {
 			return t, nil

@@ -84,15 +84,15 @@ func (p *Pool) Ensure(ctx context.Context, force bool) (string, error) {
 	if n == 0 {
 		return "", errors.New("accounts: no enabled accounts in pool")
 	}
-	// Try each account in round-robin order.
+	// Try each account in round-robin order.  The cursor advances on every
+	// selection including the force (auth-fallback) path, so successful
+	// tunnels alternate across accounts per plan §7 acceptance criterion.
 	errs := make([]string, 0, n)
 	for tried := 0; tried < n; tried++ {
 		p.mu.Lock()
 		idx := p.rrIndex % n
 		e := p.managers[idx]
-		if !force {
-			p.rrIndex = (p.rrIndex + 1) % n
-		}
+		p.rrIndex = (p.rrIndex + 1) % n
 		p.mu.Unlock()
 
 		tok, err := e.mgr.Ensure(ctx, force)
@@ -100,10 +100,6 @@ func (p *Pool) Ensure(ctx context.Context, force bool) (string, error) {
 			return tok, nil
 		}
 		errs = append(errs, fmt.Sprintf("account %s: %v", e.uid, err))
-		// On force, don't cycle; the caller already targeted a specific account.
-		if force {
-			break
-		}
 	}
 	return "", fmt.Errorf("accounts: all accounts unavailable: %s", strings.Join(errs, "; "))
 }

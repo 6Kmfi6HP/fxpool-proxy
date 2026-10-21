@@ -125,6 +125,11 @@ func run(argv []string) int {
 	if cmd == "token-refresh" {
 		f.BoolVar(&force, "force", false, "force refresh")
 	}
+	refreshUID, refreshAll := "", false
+	if cmd == "token-refresh" {
+		f.StringVar(&refreshUID, "uid", "", "account uid (multi-account mode)")
+		f.BoolVar(&refreshAll, "all", false, "refresh all accounts (multi-account mode)")
+	}
 	if cmd == "login" {
 		f.StringVar(&loginEmail, "email", "", "Firefox Account email")
 		f.BoolVar(&noVerify, "no-verify", false, "publish without Guardian refresh")
@@ -182,7 +187,7 @@ func run(argv []string) int {
 	case "token-status":
 		return cmdStatus(c)
 	case "token-refresh":
-		return cmdRefresh(c, force)
+		return cmdRefresh(c, force, refreshUID, refreshAll)
 	case "usage":
 		return cmdUsage(c)
 	case "how-to-token":
@@ -315,6 +320,24 @@ func cmdSync(c *config) int {
 	return 0
 }
 func cmdStatus(c *config) int {
+	// Explicit JWT mode: bypass the account DB; report the configured source.
+	if strings.TrimSpace(c.proxyPass) != "" {
+		m := manager(c)
+		raw, e := m.Current(0)
+		out := map[string]any{
+			"automatic_renewal_ready": false,
+			"has_proxy_pass":          e == nil,
+			"guardian":                c.guardian,
+			"refresh_state":           token.EmptyState(),
+			"explicit_proxy_pass":     true,
+		}
+		if e == nil {
+			claims, _ := token.DecodeAndValidateJWT(raw, c.guardian, time.Now(), 0)
+			out["proxy_pass"] = map[string]any{"valid": true, "seconds_left": int64(claims.Expires) - time.Now().Unix(), "algorithm_verified": false, "signature_verified": false}
+		}
+		printJSON(out)
+		return 0
+	}
 	if c.accountMode != "" {
 		db, err := openAccountDB(c)
 		if err != nil {
@@ -397,8 +420,14 @@ func cmdStatus(c *config) int {
 	printJSON(out)
 	return 0
 }
-func cmdRefresh(c *config, force bool) int {
+func cmdRefresh(c *config, force bool, uid string, all bool) int {
+	// Explicit JWT mode: refresh is not applicable.
+	if strings.TrimSpace(c.proxyPass) != "" {
+		safeError(errors.New("token-refresh is not applicable in explicit JWT mode (FXPOOL_PROXY_PASS_JWT)"))
+		return 2
+	}
 	if c.accountMode != "" {
+		// Explicit JWT check above already handled; open DB path.
 		db, err := openAccountDB(c)
 		if err != nil {
 			safeError(err)
@@ -406,7 +435,39 @@ func cmdRefresh(c *config, force bool) int {
 		}
 		defer db.Close()
 		ctx := context.Background()
-		m, _, err := managerWithDB(c, db, "")
+		if all {
+			// Refresh all accounts, collect errors.
+			accs, err := db.ListAccounts(ctx)
+			if err != nil {
+				safeError(err)
+				return 1
+			}
+			anyErr := false
+			for _, acc := range accs {
+				if !acc.Enabled {
+					continue
+				}
+				m, _, err := managerWithDB(c, db, acc.UID)
+				if err != nil {
+					safeError(fmt.Errorf("account %s: %w", acc.UID, err))
+					anyErr = true
+					continue
+				}
+				t, e := m.Refresh(ctx, force)
+				if e != nil {
+					safeError(fmt.Errorf("account %s: %w", acc.UID, e))
+					anyErr = true
+					continue
+				}
+				claims, _ := token.DecodeAndValidateJWT(t, c.guardian, time.Now(), 0)
+				fmt.Printf("[+] uid=%s seconds_left=%d\n", acc.UID, int64(claims.Expires)-time.Now().Unix())
+			}
+			if anyErr {
+				return 1
+			}
+			return 0
+		}
+		m, _, err := managerWithDB(c, db, uid)
 		if err != nil {
 			safeError(err)
 			return 1
@@ -434,6 +495,36 @@ func cmdRefresh(c *config, force bool) int {
 	return 0
 }
 func cmdUsage(c *config) int {
+	// Explicit JWT mode: bypass the account DB.
+	if strings.TrimSpace(c.proxyPass) != "" {
+		u, e := manager(c).Usage(context.Background())
+		if e != nil {
+			safeError(e)
+			return 1
+		}
+		printJSON(u)
+		return 0
+	}
+	if c.accountMode != "" {
+		db, err := openAccountDB(c)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		defer db.Close()
+		m, _, err := managerWithDB(c, db, "")
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		u, e := m.Usage(context.Background())
+		if e != nil {
+			safeError(e)
+			return 1
+		}
+		printJSON(u)
+		return 0
+	}
 	u, e := manager(c).Usage(context.Background())
 	if e != nil {
 		safeError(e)
