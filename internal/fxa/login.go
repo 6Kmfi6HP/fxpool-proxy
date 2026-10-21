@@ -33,11 +33,19 @@ type authMeta struct {
 }
 
 // accountStatusResponse is the /account/credentials/status response.
+//
+// Two shapes are in use. Legacy deployments return verifierVersion with a bare
+// clientSalt. The live server returns currentVersion plus a clientSalt that
+// already carries the quickStretchV2 namespace:
+//
+//	{"currentVersion":"v2","clientSalt":"identity.mozilla.com/picl/v1/quickStretchV2:...","upgradeNeeded":false}
 type accountStatusResponse struct {
-	Email           string `json:"email"`
-	VerifierVersion int    `json:"verifierVersion"`
-	ClientSalt      string `json:"clientSalt"`
-	UpgradeNeeded   bool   `json:"upgradeNeeded"`
+	Email             string `json:"email"`
+	CurrentVersion    string `json:"currentVersion"`
+	VerifierVersion   int    `json:"verifierVersion"`
+	ClientSalt        string `json:"clientSalt"`
+	CurrentClientSalt string `json:"currentClientSalt"`
+	UpgradeNeeded     bool   `json:"upgradeNeeded"`
 }
 
 // accountLoginResponse is the /account/login response.
@@ -126,17 +134,55 @@ func (c *Client) accountStatus(ctx context.Context, email string) (authMeta, err
 	if err := c.postJSON(ctx, "/account/credentials/status", map[string]string{"email": email}, &resp); err != nil {
 		return authMeta{}, c.cleanErr(err)
 	}
-	switch resp.VerifierVersion {
+	return resolveAuthMeta(resp, email)
+}
+
+// resolveAuthMeta maps a credentials/status response to the quick-stretch
+// parameters used for authPW derivation.
+//
+// The live v2 response has no verifierVersion field at all, and its clientSalt
+// already includes the quickStretchV2 namespace, so the salt must be used
+// verbatim rather than prefixed a second time. Legacy responses carrying
+// verifierVersion and a bare clientSalt are still accepted; v1 keeps using the
+// email as the salt.
+func resolveAuthMeta(resp accountStatusResponse, email string) (authMeta, error) {
+	version := resp.VerifierVersion
+	if version == 0 {
+		// No explicit verifierVersion: the live server reports currentVersion.
+		// An absent currentVersion keeps the historical v1 fallback.
+		switch strings.ToLower(strings.TrimSpace(resp.CurrentVersion)) {
+		case "v2":
+			version = 2
+		case "v1", "":
+			version = 1
+		default:
+			return authMeta{}, fmt.Errorf("unsupported FxA verifier version %q", resp.CurrentVersion)
+		}
+	}
+
+	salt := resp.CurrentClientSalt
+	if salt == "" {
+		salt = resp.ClientSalt
+	}
+
+	switch version {
 	case 2:
-		if resp.ClientSalt == "" {
+		if salt == "" {
 			return authMeta{}, errors.New("FxA account requires v2 key stretch but no clientSalt was returned")
 		}
-		return authMeta{VerifierVersion: 2, Salt: quickStretchSalt(2, resp.ClientSalt)}, nil
+		switch {
+		case strings.HasPrefix(salt, quickStretchV2Prefix):
+			// Already namespaced by the server: use it exactly as returned.
+			return authMeta{VerifierVersion: 2, Salt: salt}, nil
+		case strings.HasPrefix(salt, quickStretchV1Prefix):
+			return authMeta{}, errors.New("invalid v2 clientSalt: v1 quickStretch prefix")
+		default:
+			return authMeta{VerifierVersion: 2, Salt: quickStretchV2Prefix + salt}, nil
+		}
 	case 1:
 		return authMeta{VerifierVersion: 1, Salt: quickStretchSalt(1, email)}, nil
 	default:
-		// Unknown/missing verifierVersion: fall back to v1 with the given email.
-		return authMeta{VerifierVersion: 1, Salt: quickStretchSalt(1, email)}, nil
+		return authMeta{}, fmt.Errorf("unsupported FxA verifier version %d", version)
 	}
 }
 
@@ -172,6 +218,13 @@ func (c *Client) cleanErr(err error) error {
 	var e *errnoError
 	if !errors.As(err, &e) {
 		return err
+	}
+	// The Fastly WAF rejects POST /account/login (and /account/create) with a
+	// bodyless 406. Check the status before the errno switch: the empty body
+	// yields errno 0, which would otherwise fall through to the generic error.
+	if e.status == 406 {
+		return fmt.Errorf("%w: password login is not possible from this network; create the account "+
+			"with the register machine and run: fxpool-proxy import-credentials <bundle>", ErrWAFBlocked)
 	}
 	switch e.errno {
 	case errnoUnknownAccount:
