@@ -276,9 +276,15 @@ func (d *DB) Begin(ctx context.Context) (*sql.Tx, error) {
 
 // UpsertAccount inserts or updates an account by uid.
 // The session_token must never appear in log output.
+//
+// The id is read back with RETURNING: sqlite reports the previous rowid from
+// LastInsertId() on the ON CONFLICT DO UPDATE path instead of failing, so
+// trusting it writes refresh_state under the wrong account (or trips the FK
+// constraint) when an existing account is reimported.
 func (d *DB) UpsertAccount(ctx context.Context, tx *sql.Tx, a Account) (int64, error) {
 	now := a.UpdatedAt.Unix()
-	res, err := tx.ExecContext(ctx, `
+	var id int64
+	err := tx.QueryRowContext(ctx, `
 		INSERT INTO accounts(uid, email, session_token, enabled, label, source, created_at, updated_at)
 		VALUES(?,?,?,?,?,?,?,?)
 		ON CONFLICT(uid) DO UPDATE SET
@@ -288,18 +294,11 @@ func (d *DB) UpsertAccount(ctx context.Context, tx *sql.Tx, a Account) (int64, e
 			label         = excluded.label,
 			source        = excluded.source,
 			updated_at    = excluded.updated_at
+		RETURNING id
 	`, a.UID, a.Email, a.SessionToken, boolToInt(a.Enabled), a.Label, a.Source,
-		a.CreatedAt.Unix(), now)
+		a.CreatedAt.Unix(), now).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("store: upsert account %q: %w", a.UID, err)
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		// ON CONFLICT path: look it up.
-		err2 := tx.QueryRowContext(ctx, `SELECT id FROM accounts WHERE uid = ?`, a.UID).Scan(&id)
-		if err2 != nil {
-			return 0, fmt.Errorf("store: resolve account id for %q: %w", a.UID, err2)
-		}
 	}
 	return id, nil
 }

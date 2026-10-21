@@ -441,3 +441,75 @@ func TestDeleteAccountCascades(t *testing.T) {
 		t.Fatalf("refresh_state result=%q, want never (absent)", rs.Result)
 	}
 }
+
+// TestUpsertAccountReturnsTheUidRowIDOnConflict guards the reimport path:
+// sqlite reports the previous rowid via LastInsertId() on ON CONFLICT DO
+// UPDATE instead of failing, which used to point refresh_state at another
+// account and trip the FK constraint.
+func TestUpsertAccountReturnsTheUidRowIDOnConflict(t *testing.T) {
+	root := tmpRoot(t)
+	d, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	seed := func(uid, email string) int64 {
+		tx, err := d.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := d.UpsertAccount(ctx, tx, Account{
+			UID:          uid,
+			Email:        email,
+			SessionToken: "e" + uid[1:],
+			Enabled:      true,
+			Source:       "import",
+			CreatedAt:    time.Unix(1000, 0),
+			UpdatedAt:    time.Unix(1000, 0),
+		})
+		if err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	first := seed("11111111111111111111111111111111", "one@example.com")
+	second := seed("22222222222222222222222222222222", "two@example.com")
+	if first == second {
+		t.Fatalf("distinct uids share rowid %d", first)
+	}
+	// Reimport the FIRST uid after a later insert: the returned id must still
+	// be its own row, not the last inserted rowid.
+	again := seed("11111111111111111111111111111111", "one-updated@example.com")
+	if again != first {
+		t.Fatalf("reimport returned rowid %d, want %d", again, first)
+	}
+	got, err := d.GetAccount(ctx, "11111111111111111111111111111111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != first || got.Email != "one-updated@example.com" {
+		t.Fatalf("got id=%d email=%q, want id=%d email=one-updated@example.com", got.ID, got.Email, first)
+	}
+	// The refresh_state FK must accept the id returned by a reimport.
+	tx, err := d.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpsertRefreshState(ctx, tx, RefreshState{
+		AccountID: again,
+		Result:    "credentials_imported",
+	}); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("refresh_state for reimported account: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
