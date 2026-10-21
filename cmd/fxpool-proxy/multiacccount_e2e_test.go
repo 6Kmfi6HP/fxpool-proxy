@@ -96,8 +96,8 @@ func newFakeServer(uid, sessionToken string) *fakeServer {
 	return fs
 }
 
-func (fs *fakeServer) URL() string  { return fs.srv.URL }
-func (fs *fakeServer) Close()        { fs.srv.Close() }
+func (fs *fakeServer) URL() string { return fs.srv.URL }
+func (fs *fakeServer) Close()      { fs.srv.Close() }
 
 // writeBundle writes a credential bundle file for import-credentials.
 func writeBundle(t *testing.T, dir, uid, sessionToken string) string {
@@ -181,8 +181,8 @@ func TestMultiAccountImportAndList(t *testing.T) {
 		t.Fatalf("accounts list: exit %d\noutput: %s", code, out)
 	}
 	var rows []struct {
-		UID    string `json:"uid"`
-		Email  string `json:"email"`
+		UID   string `json:"uid"`
+		Email string `json:"email"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rows); err != nil {
 		t.Fatalf("json decode: %v\noutput: %s", err, out)
@@ -443,7 +443,9 @@ func TestLegacyMigrationOnAccountModeStart(t *testing.T) {
 		"accounts", "list", "--json",
 		"--root", root, "--account-mode", "rr",
 	})
-	var rows []struct{ UID string `json:"uid"` }
+	var rows []struct {
+		UID string `json:"uid"`
+	}
 	_ = json.Unmarshal([]byte(strings.TrimSpace(listOut)), &rows)
 	found := false
 	for _, r := range rows {
