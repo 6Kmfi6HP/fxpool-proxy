@@ -107,8 +107,42 @@ func run(argv []string) int {
 	// "accounts" is a sub-command family with its own argument parsing.
 	if cmd == "accounts" {
 		f, c := flagsFor(cmd)
-		_ = f.Parse(argv[1:])
-		subArgs := f.Args()
+		// Global flags (--root, --account-mode, --guardian, --fxa-base, …) may
+		// appear anywhere — before the sub-command name, between positionals, or
+		// after them. Pull them out by name so they reach flagsFor's config; the
+		// rest (sub-command name + sub-command-specific flags) go to cmdAccounts.
+		globalFlagNames := map[string]bool{
+			"root": true, "account-mode": true, "guardian": true,
+			"fxa-base": true, "fxa-token": true,
+		}
+		var globalArgv, subArgs []string
+		rest := argv[1:]
+		for i := 0; i < len(rest); i++ {
+			arg := rest[i]
+			// Flags are --name or --name=value.
+			if strings.HasPrefix(arg, "--") {
+				name := strings.TrimPrefix(arg, "--")
+				val := ""
+				if eq := strings.IndexByte(name, '='); eq >= 0 {
+					val = name[eq+1:]
+					name = name[:eq]
+					_ = val
+				}
+				if globalFlagNames[name] {
+					globalArgv = append(globalArgv, arg)
+					// If --name value (no =), consume the next token too.
+					if !strings.Contains(arg, "=") && i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
+						i++
+						globalArgv = append(globalArgv, rest[i])
+					}
+					continue
+				}
+			}
+			subArgs = append(subArgs, arg)
+		}
+		if err := f.Parse(globalArgv); err != nil {
+			return 2
+		}
 		if err := token.EnsureDirs(c.root); err != nil {
 			safeError(err)
 			return 1
@@ -281,7 +315,11 @@ func managerWithDB(c *config, db *storepkg.DB, uid string) (*token.Manager, int6
 	}
 	m := token.NewManager(c.root, c.guardian)
 	if c.fxaBase != "" {
-		m.FxAAuth = strings.TrimRight(c.fxaBase, "/")
+		base := strings.TrimRight(c.fxaBase, "/")
+		m.FxAAuth = base
+		// When tests point fxa-base at a fake server the OAuth token endpoint
+		// lives on the same origin; keep them in sync so PKCE works end-to-end.
+		m.FxAOAuth = base
 	}
 	m.ExplicitProxyPass = strings.TrimSpace(c.proxyPass)
 	m.AccessToken = strings.TrimSpace(c.fxaToken)

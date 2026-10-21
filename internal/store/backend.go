@@ -117,6 +117,17 @@ func (b *ManagerBackend) Reject(accountID int64, digest string) error {
 // in a single transaction.
 func (b *ManagerBackend) PublishCredentials(c token.Credentials) (int64, error) {
 	ctx := context.Background()
+
+	// Read existing generation BEFORE opening the transaction. With
+	// SetMaxOpenConns(1) the single connection is held by the tx, so any
+	// pool-level query inside the tx would deadlock waiting for it.
+	existingGeneration := 0
+	if prev, err := b.DB.GetAccount(ctx, c.UID); err == nil {
+		if prevRS, err := b.DB.GetRefreshState(ctx, prev.ID); err == nil {
+			existingGeneration = prevRS.Generation
+		}
+	}
+
 	tx, err := b.DB.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -151,16 +162,12 @@ func (b *ManagerBackend) PublishCredentials(c token.Credentials) (int64, error) 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM rejected_tokens WHERE account_id=?`, accID); err != nil {
 		return 0, fmt.Errorf("store: clear rejected on reimport: %w", err)
 	}
-	// Reset refresh state to credentials_imported.
+	// Reset to credentials_imported, preserving the generation counter.
 	rs := RefreshState{
 		AccountID:           accID,
 		Result:              "credentials_imported",
 		ConsecutiveFailures: 0,
-		Generation:          0,
-	}
-	// Preserve generation if state existed.
-	if existing, err := b.DB.GetRefreshState(ctx, accID); err == nil {
-		rs.Generation = existing.Generation
+		Generation:          existingGeneration,
 	}
 	if err := b.DB.UpsertRefreshState(ctx, tx, rs); err != nil {
 		return 0, err

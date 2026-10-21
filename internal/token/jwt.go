@@ -63,12 +63,14 @@ func DecodeAndValidateJWT(raw, guardian string, now time.Time, minTTL time.Durat
 	if err != nil {
 		return c, err
 	}
-	issuer, err := url.Parse(c.Issuer)
-	issuerHost := issuer.Hostname()
+	issuerHost := ""
+	if issuer, parseErr := url.Parse(c.Issuer); parseErr == nil && issuer != nil {
+		issuerHost = issuer.Hostname()
+	}
 	if issuerHost == "" {
 		issuerHost = strings.TrimSuffix(strings.ToLower(c.Issuer), "/")
 	}
-	if err != nil || !strings.EqualFold(g.Hostname(), issuerHost) {
+	if !strings.EqualFold(g.Hostname(), issuerHost) {
 		return c, fmt.Errorf("unexpected JWT issuer")
 	}
 	matchAud := false
