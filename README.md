@@ -77,14 +77,17 @@ chmod +x install.sh
 ./install.sh --help
 ```
 
-安装后导入凭据（本机 Firefox 或拷贝续期包）：
+安装后导入凭据（注册机生成的凭据包，或本机 Firefox 导出）：
 
 ```bash
+# 无 Firefox：在注册机生成 fxpool-bundles/<uid>.json 后
+./fxpool-proxy import-credentials /path/to/<uid>.json --delete-source
+# 或本机 Firefox
 ./fxpool-proxy export-credentials --import
-# 或
-./fxpool-proxy import-credentials /path/to/bundle.json --delete-source
 ./install.sh restart
 ```
+
+注册机路径见 [docs/guides/headless-credentials.md](docs/guides/headless-credentials.md)。
 
 编辑 `fxpool-proxy.env` 配置监听与鉴权，例如非回环：
 
@@ -112,25 +115,46 @@ make cross   # /tmp/fxpool-proxy-linux-{amd64,arm64}
 ## 凭据
 
 凭据包等同 FxA 登录会话，权限应为 `0600`，不要提交或分享。
+三种获取方式：注册机（推荐，无需本机 Firefox）、`login`、从本机 Firefox 导出。
 
-| 步骤 | 命令 |
+| 场景 | 命令 |
 |------|------|
-| 邮箱+密码自动登录（推荐） | `./fxpool-proxy login` |
+| 注册机生成账号、凭据包并开通（在注册机目录，无需 Firefox） | `python register.py --backend browser --count 1 --enroll --bundle-dir fxpool-bundles` |
+| 在代理机导入凭据包 | `./fxpool-proxy import-credentials <uid>.json --delete-source` |
+| 注册机与代理同机，直接写入 `tokens/`（在注册机目录） | `python register.py --backend browser --count 1 --enroll --fxpool-root /opt/fxpool` |
+| 邮箱+密码自动登录（仅限未被 WAF 拦截的网络） | `./fxpool-proxy login` |
 | 列出本机 Firefox 配置 | `./fxpool-proxy export-credentials --list` |
 | 导出续期包 | `./fxpool-proxy export-credentials -o bundle.json` |
 | 导出并写入 `tokens/` | `./fxpool-proxy export-credentials --import` |
-| 在另一台机器导入 | `./fxpool-proxy import-credentials bundle.json --delete-source` |
 | 查看状态 | `./fxpool-proxy token-status` |
 | 强制刷新 ProxyPass | `./fxpool-proxy token-refresh --force` |
 
-`login` 交互式输入 FxA 邮箱与密码（密码不回显），自动完成登录、发布续期凭据
-并换取 ProxyPass 验证；无需本机已登录的 Firefox。已启用两步验证（2FA）的账号
-会在提示时输入验证码。可选 `--email`、`--no-verify`（发布但不刷新验证）、
-`--totp CODE`（非交互提供验证码）。
+**无 Firefox（推荐）**：配套注册机
+[mozilla-account-register](https://github.com/6Kmfi6HP/mozilla-account-register)
+用反检测 Chromium 完成注册，从 `localStorage["__fxa_storage.accounts"]` 收割
+FxA session，并可选地走一次开通，写出
+`{"schema":"firefox-ip-protection-renewal-credentials-v1","email","uid","session_token"}`
+凭据包。代理机只需 `import-credentials`。完整步骤、权限与排错见
+[无 Firefox 获取续期凭据](docs/guides/headless-credentials.md)。
 
-流程：`login` 直接派生 authPW 登录 FxA，或读取 Firefox `signedInUser.json` →
-最小续期包（email / uid / session）→ FxA HAWK + PKCE OAuth → Guardian ProxyPass
-JWT → `tokens/proxy_pass.jwt`。
+**WAF 边界**：在受 Fastly WAF 影响的网络上，`POST /v1/account/create` 与
+`POST /v1/account/login` 返回 406（空响应体），因此 `login` 与注册机的
+`--backend api` 都无法工作；`/v1/account/status`、OAuth 与 Guardian 正常。
+遇到 406 时 `fxpool-proxy` 会提示改用 `import-credentials`。
+
+**开通（entitlement）**：新账号在浏览器里走一次
+`GET https://vpn.mozilla.org/api/v1/fpn/auth` 之前，`/api/v1/fpn/status` 与
+`/api/v1/fpn/token` 返回 403，`fxpool-proxy` 报 `no_entitlement` 并阻断隧道。
+注册机的 `--enroll` 负责这一步，且每账号只尝试一次。
+
+`login` 交互式输入 FxA 邮箱与密码（密码不回显），自动完成登录、发布续期凭据
+并换取 ProxyPass 验证；无需本机已登录的 Firefox，但无法在被 WAF 拦截的网络使用。
+已启用两步验证（2FA）的账号会在提示时输入验证码。可选 `--email`、`--no-verify`
+（发布但不刷新验证）、`--totp CODE`（非交互提供验证码）。
+
+流程：`login` 派生 authPW 登录 FxA；`export-credentials` 读取 Firefox
+`signedInUser.json`。两者都产出最小续期包（email / uid / session），随后
+FxA HAWK + PKCE OAuth → Guardian ProxyPass JWT → `tokens/proxy_pass.jwt`。
 
 JWT 会校验结构、算法（拒绝 `none`）、issuer、audience、时间与最小 TTL；
 Guardian 无稳定 JWKS 合约，**不验证 JWT 签名**。
@@ -186,7 +210,9 @@ fxpool-proxy version
 | `token-refresh` | 刷新 ProxyPass |
 | `usage` | Guardian 配额 |
 | `probe` | 经一节点 CONNECT 探测 ipinfo.io |
-| `login` | 邮箱+密码自动登录并发布续期凭据 |
+| `login` | 邮箱+密码自动登录并发布续期凭据（仅限未被 WAF 拦截的网络） |
+| `export-credentials` | 从本机 Firefox 导出续期包 |
+| `import-credentials` | 导入注册机或 Firefox 凭据包并验证 |
 | `run` | 启动代理池 |
 | `how-to-token` | 打印凭据步骤摘要 |
 
@@ -288,8 +314,11 @@ GHCR 镜像，生成校验和、GitHub Release 和构建来源证明。发布失
 | [docs/research/](docs/research/) | 架构、协议、源码实证 findings |
 | [docs/notes/](docs/notes/) | 路线图、观测面、验证日志 |
 | [docs/compatibility/](docs/compatibility/) | Remote Settings / Guardian 适配 |
-| [docs/guides/](docs/guides/) | 从本机 Firefox 导出续期凭据 |
+| [docs/guides/](docs/guides/) | 无 Firefox 注册机凭据、WAF 边界、开通（entitlement）与 Firefox 导出 |
 | [docs/SECURITY.md](docs/SECURITY.md) | 漏洞报告与凭据边界 |
+
+配套项目：[mozilla-account-register](https://github.com/6Kmfi6HP/mozilla-account-register)
+（反检测 Chromium 注册、FxA session 收割与一次性开通）。
 
 ## 法律
 

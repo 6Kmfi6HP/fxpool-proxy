@@ -130,11 +130,29 @@ func run(argv []string) int {
 		f.BoolVar(&exportStdout, "stdout", false, "write credential JSON to stdout (same as -o -)")
 	}
 	args := argv[1:]
-	if cmd == "import-credentials" && len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		bundle = args[0]
-		args = args[1:]
-	}
-	if e := f.Parse(args); e != nil {
+	if cmd == "import-credentials" {
+		// The bundle is positional and may be a bare "-" (stdin). Go's
+		// flag.FlagSet.Parse stops at the first non-flag argument, so consume
+		// positionals one at a time and re-parse the remainder: this keeps
+		// `import-credentials - --no-verify --root DIR` working as documented
+		// instead of silently leaving every flag after "-" unparsed.
+		for {
+			if e := f.Parse(args); e != nil {
+				return 2
+			}
+			rest := f.Args()
+			if len(rest) == 0 {
+				break
+			}
+			if bundle == "" {
+				bundle = rest[0]
+			} else {
+				fmt.Fprintln(os.Stderr, "unexpected argument:", rest[0])
+				return 2
+			}
+			args = rest[1:]
+		}
+	} else if e := f.Parse(args); e != nil {
 		return 2
 	}
 	if cmd != "export-credentials" || exportImport {
@@ -303,6 +321,9 @@ func cmdLogin(c *config, email string, noVerify bool, totp string) int {
 	}
 	sess, e := m.Login(ctx, email, password, opts...)
 	if e != nil {
+		if errors.Is(e, fxa.ErrWAFBlocked) {
+			fmt.Fprintln(os.Stderr, "[!] 此网络无法用密码登录；请在注册机生成凭据包后运行: fxpool-proxy import-credentials <bundle>")
+		}
 		safeError(e)
 		return 1
 	}

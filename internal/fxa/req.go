@@ -43,6 +43,11 @@ func (c *Client) http() *http.Client {
 	return &http.Client{Timeout: 15 * time.Second}
 }
 
+// ErrWAFBlocked marks a request rejected by the Fastly WAF in front of the FxA
+// auth server (HTTP 406 with an empty body). Password login cannot work from
+// such a network; a credential bundle must be imported instead.
+var ErrWAFBlocked = errors.New("FxA auth request blocked by the Fastly WAF (HTTP 406)")
+
 // errnoError is a non-2xx FxA response carrying the server errno.
 type errnoError struct {
 	status int
@@ -53,6 +58,13 @@ type errnoError struct {
 }
 
 func (e *errnoError) Error() string { return e.msg }
+
+// Status returns the HTTP status code of the rejected request.
+func (e *errnoError) Status() int { return e.status }
+
+// Errno returns the FxA errno carried by the response (0 when the body is
+// empty or does not contain one).
+func (e *errnoError) Errno() int { return e.errno }
 
 // canonicalEmail returns the corrected email the server suggests on an
 // email-case mismatch (errno 120), or "" if absent.

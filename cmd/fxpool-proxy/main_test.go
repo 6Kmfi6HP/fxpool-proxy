@@ -158,3 +158,65 @@ func TestExportCredentialsFromFirefoxDir(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+
+// TestCredentialImportStdinFlagOrdering is a regression test for the documented
+// `import-credentials - --root DIR --no-verify` invocation. A bare "-" is a
+// non-flag argument, so a single flag.FlagSet.Parse would stop there and leave
+// every following flag unparsed.
+func TestCredentialImportStdinFlagOrdering(t *testing.T) {
+	raw := `{"schema":"firefox-ip-protection-renewal-credentials-v1","email":"x@example.invalid","uid":"00112233445566778899aabbccddeeff","session_token":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"}`
+	for _, tc := range []struct {
+		name string
+		args func(root string) []string
+	}{
+		{
+			name: "bundle first",
+			args: func(root string) []string {
+				return []string{"import-credentials", "-", "--no-verify", "--root", root}
+			},
+		},
+		{
+			name: "bundle between flags",
+			args: func(root string) []string {
+				return []string{"import-credentials", "--no-verify", "-", "--root", root}
+			},
+		},
+		{
+			name: "bundle last",
+			args: func(root string) []string {
+				return []string{"import-credentials", "--root", root, "--no-verify", "-"}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			oldStdin := os.Stdin
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.WriteString(raw); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			os.Stdin = r
+			t.Cleanup(func() {
+				os.Stdin = oldStdin
+				_ = r.Close()
+			})
+
+			if got := run(tc.args(root)); got != 0 {
+				t.Fatalf("exit %d", got)
+			}
+			info, err := os.Stat(filepath.Join(root, "tokens", "renewal_credentials.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("mode %o", info.Mode().Perm())
+			}
+		})
+	}
+}

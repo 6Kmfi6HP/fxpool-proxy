@@ -18,6 +18,12 @@ const (
 	quickStretchV1 = 1000
 	// quickStretchV2 iterates the raw password 650000 times.
 	quickStretchV2 = 650000
+
+	// quickStretchV1Prefix and quickStretchV2Prefix are the namespaced salt
+	// prefixes. The live credentials/status endpoint returns v2 clientSalt
+	// values that already carry quickStretchV2Prefix.
+	quickStretchV1Prefix = NAMESPACE + "quickStretch:"
+	quickStretchV2Prefix = NAMESPACE + "quickStretchV2:"
 )
 
 // authPW derives the password verifier sent to /account/login.
@@ -62,9 +68,20 @@ func hkdf(secret []byte, info string, n int) []byte {
 }
 
 // quickStretchSalt builds the v1 or v2 PBKDF2 salt string.
+//
+// A value that already carries the matching namespace prefix is returned
+// verbatim: the live /account/credentials/status endpoint returns v2 clientSalt
+// values in fully namespaced form, and prefixing them again would derive a
+// wrong authPW.
 func quickStretchSalt(verifierVersion int, emailOrSalt string) string {
 	if verifierVersion == 2 {
-		return NAMESPACE + "quickStretchV2:" + emailOrSalt
+		if strings.HasPrefix(emailOrSalt, quickStretchV2Prefix) {
+			return emailOrSalt
+		}
+		return quickStretchV2Prefix + emailOrSalt
 	}
-	return NAMESPACE + "quickStretch:" + emailOrSalt
+	if strings.HasPrefix(emailOrSalt, quickStretchV1Prefix) {
+		return emailOrSalt
+	}
+	return quickStretchV1Prefix + emailOrSalt
 }
