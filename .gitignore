@@ -35,3 +35,4 @@ browser_profiles/
 
 # Local Go build output.
 /fxpool-proxy
+cmd/fxpool-proxy/data/fxpool.db
