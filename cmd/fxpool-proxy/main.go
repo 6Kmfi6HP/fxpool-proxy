@@ -280,7 +280,7 @@ func managerWithDB(c *config, db *storepkg.DB, uid string) (*token.Manager, int6
 	}
 	m.ExplicitProxyPass = strings.TrimSpace(c.proxyPass)
 	m.AccessToken = strings.TrimSpace(c.fxaToken)
-	m.Store = &storepkg.ManagerBackend{DB: db, AccountID: acc.ID}
+	m.Store = &storepkg.ManagerBackend{DB: db}
 	m.AccountID = acc.ID
 	return m, acc.ID, nil
 }
@@ -1040,7 +1040,7 @@ func cmdImport(c *config, path string, deleteSource, noVerify bool) int {
 		m, _, err := managerWithDB(c, db, "")
 		if err != nil {
 			// First import: no account yet. Use a bare DB-backed manager.
-			bk := &storepkg.ManagerBackend{DB: db, AccountID: 0}
+			bk := &storepkg.ManagerBackend{DB: db}
 			m = token.NewManager(c.root, c.guardian)
 			if c.fxaBase != "" {
 				m.FxAAuth = strings.TrimRight(c.fxaBase, "/")

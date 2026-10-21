@@ -241,7 +241,38 @@ func TestPoolManagerForUID(t *testing.T) {
 	}
 }
 
-// fakeJWT returns a syntactically plausible JWT with a future exp.
+// TestPoolRejectUnknownDigestDoesNotPollute verifies that Reject on a token
+// whose digest is not in proxy_pass (already superseded) returns nil without
+// writing to any account's rejected list.
+func TestPoolRejectUnknownDigestDoesNotPollute(t *testing.T) {
+	db, root := makeDB(t)
+	ctx := context.Background()
+
+	uid := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3"
+	idA := addAccount(t, db, uid, "g@x.com", "7777777777777777777777777777777777777777777777777777777777777777")
+	// Store a different token (not the one we will reject).
+	storeToken(t, db, idA, "jwt-current", time.Now().Add(time.Hour))
+
+	p, err := NewPool(ctx, db, root, "https://vpn.mozilla.org", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reject a token whose digest is NOT in proxy_pass.
+	if err := p.Reject("jwt-never-stored"); err != nil {
+		t.Fatalf("Reject unknown token: %v", err)
+	}
+
+	// The unknown digest must not appear in rejected_tokens for any account.
+	ok, err := db.IsRejected(ctx, store.DigestFor("jwt-never-stored"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("unknown digest was incorrectly written to rejected_tokens")
+	}
+}
+
 // It is NOT cryptographically valid — only for use where DecodeAndValidateJWT
 // is not called with a non-empty guardian URL.
 func fakeJWT() string {

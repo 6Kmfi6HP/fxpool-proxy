@@ -58,7 +58,7 @@ func NewPool(ctx context.Context, db *store.DB, root, guardian, fxaBase string, 
 		if client != nil {
 			mgr.Client = client
 		}
-		mgr.Store = &store.ManagerBackend{DB: db, AccountID: acc.ID}
+		mgr.Store = &store.ManagerBackend{DB: db}
 		mgr.AccountID = acc.ID
 		p.managers = append(p.managers, &entry{
 			accountID: acc.ID,
@@ -110,26 +110,19 @@ func (p *Pool) Ensure(ctx context.Context, force bool) (string, error) {
 
 // Reject marks the raw token as rejected in the owning account's rejected list.
 // It looks up the account by the token's SHA-256 digest in the proxy_pass table.
+// If the digest is not found in the proxy_pass table the token is no longer the
+// current token for any account (it was already superseded by a refresh), so
+// there is nothing to reject and the call succeeds silently.  Writing the
+// digest to every account's rejected list in that case would incorrectly poison
+// accounts that never used the token.
 func (p *Pool) Reject(raw string) error {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(raw)))
 	digest := hex.EncodeToString(sum[:])
 	ctx := context.Background()
 	accID, err := p.db.AccountIDForDigest(ctx, digest)
 	if err != nil {
-		// Token not found in proxy_pass — reject on all accounts as a safety net.
-		var errs []string
-		p.mu.Lock()
-		mgrs := make([]*entry, len(p.managers))
-		copy(mgrs, p.managers)
-		p.mu.Unlock()
-		for _, e := range mgrs {
-			if re := e.mgr.Reject(raw); re != nil {
-				errs = append(errs, re.Error())
-			}
-		}
-		if len(errs) > 0 {
-			return errors.New(strings.Join(errs, "; "))
-		}
+		// Token not in proxy_pass: already superseded by a refresh.
+		// No action needed; return success rather than polluting all accounts.
 		return nil
 	}
 	// Found the owning account: reject only there.

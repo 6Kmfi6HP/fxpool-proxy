@@ -10,13 +10,13 @@ import (
 	"fxpool-proxy/internal/token"
 )
 
-// ManagerBackend wraps a *DB and an account_id to satisfy token.StoreBackend.
-// This breaks the import cycle: store imports token for legacy migration;
-// token cannot import store, so it defines the StoreBackend interface
-// and store provides the concrete implementation here.
+// ManagerBackend wraps a *DB to satisfy token.StoreBackend.
+// The account ID is passed per-call by the Manager (via Manager.AccountID),
+// not stored here. Storing it here alongside Manager.AccountID would create
+// two independent copies that could silently diverge; all methods receive it
+// as a parameter through the StoreBackend interface instead.
 type ManagerBackend struct {
-	DB        *DB
-	AccountID int64
+	DB *DB
 }
 
 // Compile-time check that ManagerBackend satisfies token.StoreBackend.
