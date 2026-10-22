@@ -18,7 +18,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
@@ -145,9 +144,8 @@ func (d *DB) checkMode() error {
 	if err != nil {
 		return fmt.Errorf("store: stat db: %w", err)
 	}
-	sys, ok := fi.Sys().(*syscall.Stat_t)
-	if ok && sys.Uid != uint32(os.Getuid()) {
-		return fmt.Errorf("store: database owned by uid %d, current uid %d", sys.Uid, os.Getuid())
+	if err := checkOwner(fi); err != nil {
+		return err
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf("store: database permissions are %04o, want 0600", fi.Mode().Perm())
