@@ -11,7 +11,7 @@ TCP 流量始终走 HTTPS CONNECT；MASQUE CONNECT-UDP 只承载 UDP（如 QUIC/
 未知上游协议、未知过滤表达式、未鉴权的非回环监听均会 fail closed。
 与 Mozilla / Firefox / Fastly 无官方隶属关系。
 
-要求 Go 1.25+（一键安装会自动 `go build`）。Linux 建议配合 systemd。
+要求 Go 1.26.10+（一键安装会自动 `go build`）。Linux 建议配合 systemd。
 
 ## 下载发布版本
 
@@ -116,6 +116,10 @@ make cross   # /tmp/fxpool-proxy-linux-{amd64,arm64}
 
 凭据包等同 FxA 登录会话，权限应为 `0600`，不要提交或分享。
 三种获取方式：注册机（推荐，无需本机 Firefox）、`login`、从本机 Firefox 导出。
+账号级数据（凭据、ProxyPass、刷新状态、拒绝列表）保存在 `data/fxpool.db`
+（SQLite，权限 `0600`）；首次启动账号模式时会离线、幂等地把旧
+`tokens/renewal_credentials.json`、`proxy_pass.jwt`、`refresh_state.json`
+迁移进数据库，旧文件保持原位不动。
 
 | 场景 | 命令 |
 |------|------|
@@ -128,6 +132,9 @@ make cross   # /tmp/fxpool-proxy-linux-{amd64,arm64}
 | 导出并写入 `tokens/` | `./fxpool-proxy export-credentials --import` |
 | 查看状态 | `./fxpool-proxy token-status` |
 | 强制刷新 ProxyPass | `./fxpool-proxy token-refresh --force` |
+| 列出所有账号 | `./fxpool-proxy accounts list` |
+| 启用 / 禁用账号 | `./fxpool-proxy accounts enable <uid>` / `accounts disable <uid>` |
+| 删除账号及其数据 | `./fxpool-proxy accounts remove --yes <uid>` |
 
 **无 Firefox（推荐）**：配套注册机
 [mozilla-account-register](https://github.com/6Kmfi6HP/mozilla-account-register)
@@ -193,46 +200,54 @@ FXPOOL_COUNTRIES=US FXPOOL_LIMIT=1 ./install.sh run
 ```text
 fxpool-proxy sync
 fxpool-proxy token-status
-fxpool-proxy token-refresh [--force]
+fxpool-proxy token-refresh [--force] [--uid UID] [--all]
 fxpool-proxy usage
 fxpool-proxy how-to-token
 fxpool-proxy probe [--country US]
 fxpool-proxy run
+fxpool-proxy login
 fxpool-proxy export-credentials [options]
 fxpool-proxy import-credentials BUNDLE [--delete-source] [--no-verify]
+fxpool-proxy accounts <list|enable|disable|remove>
 fxpool-proxy version
 ```
 
 | 命令 | 作用 |
 |------|------|
 | `sync` | 拉取节点列表，写出 `export/exits.json` |
-| `token-status` | JSON：续期就绪、ProxyPass、刷新状态 |
-| `token-refresh` | 刷新 ProxyPass |
-| `usage` | Guardian 配额 |
+| `token-status` | JSON：续期就绪、ProxyPass、刷新状态；多账号时输出所有账号列表 |
+| `token-refresh` | 刷新 ProxyPass；`--uid` 指定账号，`--all` 刷新全部 |
+| `usage` | Guardian 配额（多账号模式下查询当前选中账号） |
 | `probe` | 经一节点 CONNECT 探测 ipinfo.io |
 | `login` | 邮箱+密码自动登录并发布续期凭据（仅限未被 WAF 拦截的网络） |
 | `export-credentials` | 从本机 Firefox 导出续期包 |
-| `import-credentials` | 导入注册机或 Firefox 凭据包并验证 |
+| `import-credentials` | 导入注册机或 Firefox 凭据包并验证；多账号模式下按 uid upsert |
+| `accounts list` | 列出所有账号的 uid、email、启用状态与刷新状态；`--json` 输出 JSON |
+| `accounts enable/disable` | 按 uid 启用或禁用账号（禁用不删历史状态） |
+| `accounts remove --yes` | 按 uid 级联删除账号及其所有数据 |
 | `run` | 启动代理池 |
 | `how-to-token` | 打印凭据步骤摘要 |
 
 `run` 常用标志：`--countries`、`--limit`、`--no-socks` / `--no-http`、
 `--rotator` / `--http-rotator`（`off` 关闭综合入口）、`--rotate-mode random|rr`、
+`--account-mode rr`（多账号轮询）、
 `--force-sync`、`--allow-no-token`、`--recommended`、`--auth-user` / `--auth-pass`、
 `--require-auth`、`--allow-open-proxy`、`--root`。
 
 ## 环境变量
 
-优先 `FXPOOL_*`，未设置时回退已弃用的 `IPP_*`。也可写入 `fxpool-proxy.env`。
+二进制优先读 `FXPOOL_*`，未设置时回退已弃用的 `IPP_*`。也可写入 `fxpool-proxy.env`
+（`install.sh run` 会 source 后以标志形式传给二进制）。标 † 的变量仅 `install.sh`
+使用，二进制本身不读取。
 
 | 变量 | 用途 | 默认 |
 |------|------|------|
 | `FXPOOL_BIND` | 监听地址 | `127.0.0.1` |
-| `FXPOOL_ADVERTISE_HOST` | 导出 URL 中的主机 | 同 `BIND` |
+| `FXPOOL_ADVERTISE_HOST` | 导出 URL 中的主机 | 未设置时同 `BIND` |
 | `FXPOOL_COUNTRIES` | 国家过滤（逗号分隔） | 全部可用 |
 | `FXPOOL_ROTATE_MODE` | `random` / `rr` | `random` |
-| `FXPOOL_ROTATOR` | 综合 SOCKS 地址或 `off` | `{bind}:1090` |
-| `FXPOOL_HTTP_ROTATOR` | 综合 HTTP 地址或 `off` | `{bind}:8080` |
+| `FXPOOL_ROTATOR` | 综合 SOCKS 地址或 `off` | 未设置时 `{bind}:1090` |
+| `FXPOOL_HTTP_ROTATOR` | 综合 HTTP 地址或 `off` | 未设置时 `{bind}:8080` |
 | `FXPOOL_LISTEN_USER` / `LISTEN_PASS` | 本地代理鉴权 | 空（仅回环可开） |
 | `FXPOOL_GUARDIAN` | Guardian 基址 | `https://vpn.mozilla.org` |
 | `FXPOOL_PROXY_PASS_JWT` | 显式 ProxyPass | — |
@@ -240,11 +255,13 @@ fxpool-proxy version
 | `FXPOOL_FIREFOX_VERSION` | Remote Settings 过滤用版本 | 内置默认 |
 | `FXPOOL_CLIENT_COUNTRY` | 客户端国家过滤上下文 | — |
 | `FXPOOL_MASQUE_URI` | MASQUE 代理 URI 模板（启用 UDP 中继） | — |
-| `FXPOOL_UDP_BASE` | UDP 中继起始端口 | `41000` |
-| `FXPOOL_BINARY` | 二进制路径 | `./fxpool-proxy` |
-| `FXPOOL_REFRESH_BEFORE_START` | `install.sh run` 启动前刷新 | `1` |
-| `FXPOOL_LIMIT` | 节点数上限 | — |
-| `FXPOOL_SERVICE_NAME` | systemd 单元名 | `fxpool-proxy.service` |
+| `FXPOOL_ACCOUNT_MODE` | 多账号 token 选择策略（`rr`） | — |
+| `FXPOOL_BINARY` † | 二进制路径 | `./fxpool-proxy` |
+| `FXPOOL_REFRESH_BEFORE_START` † | `install.sh run` 启动前刷新 | `1` |
+| `FXPOOL_LIMIT` † | 节点数上限（install.sh 转为 `--limit`） | — |
+| `FXPOOL_SERVICE_NAME` † | systemd 单元名 | `fxpool-proxy.service` |
+
+UDP 中继端口通过 `--udp-base` 标志设置（默认 `41000`），无对应环境变量。
 
 `FXPOOL_PYTHON` / `IPP_PYTHON` 已弃用，仅警告，不会执行。
 
@@ -254,9 +271,10 @@ fxpool-proxy version
 
 | 路径 | 内容 |
 |------|------|
-| `tokens/renewal_credentials.json` | FxA 续期凭据（`0600`） |
-| `tokens/proxy_pass.jwt` | ProxyPass JWT（`0600`） |
-| `tokens/refresh_state.json` | 刷新状态机（`0600`） |
+| `data/fxpool.db` | 账号库：凭据、ProxyPass、刷新状态、拒绝列表（SQLite，`0600`） |
+| `tokens/renewal_credentials.json` | FxA 续期凭据——单账号模式或迁移保留文件（`0600`） |
+| `tokens/proxy_pass.jwt` | ProxyPass JWT——单账号模式或迁移保留文件（`0600`） |
+| `tokens/refresh_state.json` | 刷新状态——单账号模式或迁移保留文件（`0600`） |
 | `data/vpn-serverlist.json` | Remote Settings 缓存 |
 | `data/port-map.json` | 稳定端口映射 |
 | `export/socks5.txt` / `http.txt` | 监听地址列表 |
@@ -267,7 +285,8 @@ fxpool-proxy version
 | `fxpool-proxy.env` | 安装脚本生成的环境文件（勿提交） |
 
 敏感文件拒绝符号链接，有大小上限；写入为临时文件 + fsync + 原子 rename。
-不要提交 `tokens/`、运行时数据、日志或带鉴权的导出。
+账号库 `data/fxpool.db` 包含所有账号的 session token，按最高敏感度保护，
+备份时保持 `0600` 权限。不要提交 `tokens/`、`data/fxpool.db`、运行时数据、日志或带鉴权的导出。
 
 ## 安全边界
 
@@ -304,6 +323,61 @@ git push origin v0.1.0
 `.github/workflows/release.yml` 会重新执行发布校验，构建六个平台包与多架构
 GHCR 镜像，生成校验和、GitHub Release 和构建来源证明。发布失败时修复后使用
 新的补丁版本，不移动或覆盖已发布标签。
+
+## 多账号模式
+
+同时保存多个 FxA 账号的凭据，`run` 在它们之间轮询分配出口 token，
+单个账号认证失败时自动切换到其他可用账号。
+
+启用：传入 `--account-mode rr`（或设置 `FXPOOL_ACCOUNT_MODE=rr`），
+其余命令与单账号完全兼容。
+
+### 导入多个账号
+
+```bash
+# 每个账号一个凭据包，逐个导入
+./fxpool-proxy import-credentials fxpool-bundles/uid1.json --delete-source --account-mode rr
+./fxpool-proxy import-credentials fxpool-bundles/uid2.json --delete-source --account-mode rr
+```
+
+### 查看账号列表
+
+```bash
+./fxpool-proxy accounts list
+./fxpool-proxy accounts list --json
+```
+
+### 启动多账号代理池
+
+```bash
+./fxpool-proxy run --account-mode rr
+# 或通过环境变量
+FXPOOL_ACCOUNT_MODE=rr ./install.sh run
+```
+
+### 管理账号
+
+```bash
+# 临时禁用某账号（不删数据，冷却结束后可重新启用）
+./fxpool-proxy accounts disable <uid>
+./fxpool-proxy accounts enable <uid>
+
+# 永久删除账号及其 ProxyPass、刷新状态、拒绝列表
+./fxpool-proxy accounts remove --yes <uid>
+
+# 查看所有账号刷新状态（多账号模式下 token-status 输出列表）
+./fxpool-proxy token-status --account-mode rr
+
+# 刷新指定账号
+./fxpool-proxy token-refresh --account-mode rr --uid <uid>
+
+# 刷新全部账号
+./fxpool-proxy token-refresh --account-mode rr --all
+```
+
+账号数据存储在 `data/fxpool.db`（SQLite，`0600`）。首次以账号模式启动时，
+现有 `tokens/renewal_credentials.json` 会自动离线迁移进数据库，旧文件保留原位。
+数据库包含所有账号的 session token，备份时保持 `0600` 权限，不要提交或分享。
 
 ## 文档
 

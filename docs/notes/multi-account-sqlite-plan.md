@@ -1,8 +1,23 @@
 # 多账号负载均衡与 SQLite 存储改造计划
 
-状态：修订提案，未实施
+状态：已实施（Phase 1–3 完成）
 日期：2026-10-21
 目标读者：维护者 / 实施者
+
+> **实施说明（2026-10-22 更新）**：Phase 1（`internal/store` SQLite）、
+> Phase 2（DB-backed Manager）与 Phase 3（Pool 与多账号 CLI）已落地。
+> 当前代码事实：
+> - `internal/store` 用 `modernc.org/sqlite` 提供 WAL 模式、`user_version` 迁移、
+>   账号 upsert、旧文件离线导入与失败关闭的安全打开；
+> - `internal/accounts.Pool` 以 `rr` 轮询可用账号，认证失败时拒绝当前 token
+>   并切换；
+> - CLI 新增 `--account-mode` / `FXPOOL_ACCOUNT_MODE`、`accounts list|enable|disable|remove`、
+>   `token-refresh --uid/--all`；
+> - 单账号默认行为不变：不传 `--account-mode` 时仍走文件型 `token.Manager`，
+>   `token-status` 输出与 Phase 0 基线兼容。
+>
+> Phase 4（配额加权 `least-used`）与 Phase 5（四平台构建矩阵）尚未实施，
+> 当前构建矩阵仍为 Linux amd64/arm64。本文档其余章节保留为后续阶段的设计依据。
 
 ## 1. 审查结论
 

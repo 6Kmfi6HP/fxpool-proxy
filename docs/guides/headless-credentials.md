@@ -101,12 +101,18 @@ python register.py --backend browser --count 1 \
 ```bash
 scp fxpool-bundles/<uid>.json proxy:/tmp/<uid>.json
 ssh proxy 'chmod 600 /tmp/<uid>.json'
+# 单账号模式（默认）
 ssh proxy 'cd /opt/fxpool && ./fxpool-proxy import-credentials /tmp/<uid>.json --delete-source'
+# 多账号模式：逐个导入，每个账号按 uid upsert 进数据库
+ssh proxy 'cd /opt/fxpool && ./fxpool-proxy import-credentials /tmp/<uid>.json --delete-source --account-mode rr'
 ```
 
 `import-credentials` 默认会在发布后立即刷新一次 ProxyPass 作为验证；
 `--no-verify` 只发布不验证；`--delete-source` 在成功后删除源文件
 （使用 `--no-verify` 时导入后即删除）。也支持 `-` 从 stdin 读取。
+
+多账号模式下，同一个 uid 重新导入会原子地重置该账号的 ProxyPass、刷新状态
+和拒绝列表，不影响其他账号。
 
 ### 3. 验证
 
@@ -118,6 +124,9 @@ ssh proxy 'cd /opt/fxpool && ./fxpool-proxy import-credentials /tmp/<uid>.json -
 
 `token-status` 中 `automatic_renewal_ready` 与 `has_proxy_pass` 应为 `true`，
 `refresh_state.result` 为 `success`。
+
+多账号模式下，用 `./fxpool-proxy accounts list` 确认所有账号的启用状态与刷新状态；
+用 `./fxpool-proxy token-status --account-mode rr` 查看所有账号详情（多账号时以列表形式输出）。
 
 ## 同机直写（可选）
 
