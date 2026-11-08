@@ -29,6 +29,11 @@ type Client struct {
 // DefaultBase is the production FxA auth-server base URL.
 const DefaultBase = "https://api.accounts.firefox.com/v1"
 
+// DefaultUserAgent is sent when Client.UserAgent is empty. The FxA auth
+// server enforces a User-Agent allowlist (since 2026-11-07) that answers
+// 406 Not Acceptable to the old pool UA, so this must stay browser-shaped.
+const DefaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:157.0) Gecko/20100101 Firefox/157.0"
+
 func (c *Client) base() string {
 	if c.Base == "" {
 		return DefaultBase
@@ -101,7 +106,7 @@ func (c *Client) postJSON(ctx context.Context, path string, body, out any) error
 	req.Header.Set("Pragma", "no-cache")
 	ua := c.UserAgent
 	if ua == "" {
-		ua = "firefox-ip-protection-pool/3.0"
+		ua = DefaultUserAgent
 	}
 	req.Header.Set("User-Agent", ua)
 	resp, err := c.http().Do(req)

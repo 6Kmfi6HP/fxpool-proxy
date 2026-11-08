@@ -28,6 +28,28 @@ import (
 const ClientID = "5882386c6d801776"
 const Scopes = "profile https://identity.mozilla.com/apps/vpn"
 
+// poolUserAgent identifies this tool on endpoints that accept it
+// (Guardian API, Remote Settings, egress CONNECT tunnels).
+const poolUserAgent = "firefox-ip-protection-pool/3.0"
+
+// fxaUserAgent is sent to *.accounts.firefox.com: the FxA auth server began
+// enforcing a User-Agent allowlist around 2026-11-07 and answers
+// 406 Not Acceptable (empty body) to the pool UA. Browser-shaped UAs and
+// generic HTTP client defaults are still accepted; HAWK/session tokens are
+// unaffected. Verified empirically: api.accounts.firefox.com and
+// oauth.accounts.firefox.com both 406 the pool UA and 200 a Firefox UA.
+const fxaUserAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:157.0) Gecko/20100101 Firefox/157.0"
+
+// userAgentFor picks the UA for endpoint: browser UA on FxA hosts, the pool
+// UA everywhere else (Guardian rejects browser UAs with 406, so the split
+// is per-host, not global).
+func userAgentFor(endpoint string) string {
+	if strings.Contains(endpoint, "accounts.firefox.com") {
+		return fxaUserAgent
+	}
+	return poolUserAgent
+}
+
 type Credentials struct {
 	Schema       int    `json:"schema"`
 	Email        string `json:"email"`
@@ -520,7 +542,7 @@ func (m *Manager) jsonRequest(ctx context.Context, method, endpoint string, body
 		return nil, e
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "firefox-ip-protection-pool/3.0")
+	req.Header.Set("User-Agent", userAgentFor(endpoint))
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Pragma", "no-cache")
 	if body != nil {
