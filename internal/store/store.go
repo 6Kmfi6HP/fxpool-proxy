@@ -25,7 +25,7 @@ import (
 
 const (
 	// CurrentSchemaVersion is the PRAGMA user_version value this binary writes.
-	CurrentSchemaVersion = 1
+	CurrentSchemaVersion = 2
 
 	// MaxRejectedPerAccount is the per-account cap on stored reject digests.
 	MaxRejectedPerAccount = 32
@@ -188,10 +188,16 @@ func (d *DB) migrate() error {
 	if ver == CurrentSchemaVersion {
 		return nil
 	}
-	// ver == 0: fresh database, apply v1 schema.
-	_, err := d.db.ExecContext(context.Background(), schemaV1)
-	if err != nil {
-		return fmt.Errorf("store: apply schema v1: %w", err)
+	if ver < 1 {
+		if _, err := d.db.ExecContext(context.Background(), schemaV1); err != nil {
+			return fmt.Errorf("store: apply schema v1: %w", err)
+		}
+		ver = 1
+	}
+	if ver < 2 {
+		if _, err := d.db.ExecContext(context.Background(), schemaV2); err != nil {
+			return fmt.Errorf("store: apply schema v2: %w", err)
+		}
 	}
 	return nil
 }
@@ -243,6 +249,19 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 
 PRAGMA user_version = 1;
+`
+
+const schemaV2 = `
+CREATE TABLE IF NOT EXISTS quotas (
+  account_id      INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  unlimited       INTEGER NOT NULL DEFAULT 0,
+  limit_bytes     INTEGER,
+  remaining_bytes INTEGER,
+  reset_time      TEXT NOT NULL DEFAULT '',
+  updated_at      INTEGER NOT NULL
+);
+
+PRAGMA user_version = 2;
 `
 
 // MetaGet retrieves a value from the meta table.
@@ -549,4 +568,103 @@ func nullIntToTime(n sql.NullInt64) *time.Time {
 	}
 	t := time.Unix(n.Int64, 0)
 	return &t
+}
+
+// Quota describes an account's Guardian traffic limit.
+type Quota struct {
+	AccountID      int64
+	Unlimited      bool
+	LimitBytes     *int
+	RemainingBytes *int
+	ResetTime      string
+	UpdatedAt      time.Time
+}
+
+// UpsertQuota writes or updates a quota row.
+func (d *DB) UpsertQuota(ctx context.Context, tx *sql.Tx, q Quota) error {
+	unlimitedInt := 0
+	if q.Unlimited {
+		unlimitedInt = 1
+	}
+	query := `
+		INSERT INTO quotas(account_id, unlimited, limit_bytes, remaining_bytes, reset_time, updated_at)
+		VALUES(?,?,?,?,?,?)
+		ON CONFLICT(account_id) DO UPDATE SET
+			unlimited       = excluded.unlimited,
+			limit_bytes     = excluded.limit_bytes,
+			remaining_bytes = excluded.remaining_bytes,
+			reset_time      = excluded.reset_time,
+			updated_at      = excluded.updated_at
+	`
+	exec := d.db.ExecContext
+	if tx != nil {
+		exec = tx.ExecContext
+	}
+	_, err := exec(ctx, query, q.AccountID, unlimitedInt, q.LimitBytes, q.RemainingBytes, q.ResetTime, q.UpdatedAt.Unix())
+	if err != nil {
+		return fmt.Errorf("store: upsert quota: %w", err)
+	}
+	return nil
+}
+
+// GetQuota retrieves the quota row for an account.
+func (d *DB) GetQuota(ctx context.Context, accountID int64) (Quota, bool, error) {
+	var q Quota
+	var unlimitedInt int
+	var limitBytes, remainingBytes sql.NullInt64
+	var updatedAt int64
+	err := d.db.QueryRowContext(ctx, `
+		SELECT account_id, unlimited, limit_bytes, remaining_bytes, reset_time, updated_at
+		FROM quotas WHERE account_id = ?`, accountID).
+		Scan(&q.AccountID, &unlimitedInt, &limitBytes, &remainingBytes, &q.ResetTime, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Quota{}, false, nil
+	}
+	if err != nil {
+		return Quota{}, false, fmt.Errorf("store: get quota: %w", err)
+	}
+	q.Unlimited = unlimitedInt == 1
+	if limitBytes.Valid {
+		n := int(limitBytes.Int64)
+		q.LimitBytes = &n
+	}
+	if remainingBytes.Valid {
+		n := int(remainingBytes.Int64)
+		q.RemainingBytes = &n
+	}
+	q.UpdatedAt = time.Unix(updatedAt, 0)
+	return q, true, nil
+}
+
+// ListQuotas retrieves quotas for all accounts mapped by account_id.
+func (d *DB) ListQuotas(ctx context.Context) (map[int64]Quota, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT account_id, unlimited, limit_bytes, remaining_bytes, reset_time, updated_at
+		FROM quotas`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list quotas: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[int64]Quota)
+	for rows.Next() {
+		var q Quota
+		var unlimitedInt int
+		var limitBytes, remainingBytes sql.NullInt64
+		var updatedAt int64
+		if err := rows.Scan(&q.AccountID, &unlimitedInt, &limitBytes, &remainingBytes, &q.ResetTime, &updatedAt); err != nil {
+			return nil, fmt.Errorf("store: scan quota: %w", err)
+		}
+		q.Unlimited = unlimitedInt == 1
+		if limitBytes.Valid {
+			n := int(limitBytes.Int64)
+			q.LimitBytes = &n
+		}
+		if remainingBytes.Valid {
+			n := int(remainingBytes.Int64)
+			q.RemainingBytes = &n
+		}
+		q.UpdatedAt = time.Unix(updatedAt, 0)
+		out[q.AccountID] = q
+	}
+	return out, rows.Err()
 }

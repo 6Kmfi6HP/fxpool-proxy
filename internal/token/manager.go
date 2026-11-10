@@ -96,6 +96,10 @@ type StoreBackend interface {
 	// ID (which may differ from the Manager's current AccountID on first
 	// import).
 	PublishCredentials(c Credentials) (int64, error)
+	// SaveQuota persists a quota row for the account.
+	SaveQuota(accountID int64, u Usage) error
+	// LoadQuota returns the stored quota for the account.
+	LoadQuota(accountID int64) (Usage, error)
 }
 type Usage struct {
 	Unlimited  *bool  `json:"unlimited"`
@@ -108,7 +112,7 @@ type Usage struct {
 func (m *Manager) Usage(ctx context.Context) (Usage, error) {
 	access := m.AccessToken
 	if access == "" {
-		c, e := m.LoadCredentials()
+		c, e := m.loadCreds()
 		if e != nil {
 			return Usage{}, e
 		}
@@ -143,6 +147,9 @@ func (m *Manager) Usage(ctx context.Context) (Usage, error) {
 		}
 		u.Unlimited = &b
 		if b {
+			if m.Store != nil {
+				_ = m.Store.SaveQuota(m.AccountID, u)
+			}
 			return u, nil
 		}
 	}
@@ -160,6 +167,9 @@ func (m *Manager) Usage(ctx context.Context) (Usage, error) {
 	u.Limit = &limit
 	u.Remaining = &remaining
 	u.Reset = resp.Header.Get("X-Quota-Reset")
+	if m.Store != nil {
+		_ = m.Store.SaveQuota(m.AccountID, u)
+	}
 	return u, nil
 }
 
@@ -382,9 +392,12 @@ func (m *Manager) Refresh(ctx context.Context, force bool) (string, error) {
 		}
 		defer m.destroy(context.WithoutCancel(ctx), access)
 	}
-	tok, e := m.guardianToken(ctx, access)
+	tok, usage, e := m.guardianToken(ctx, access)
 	if e != nil {
 		return "", m.fail(classify(e), httpStatus(e), e)
+	}
+	if usage != nil && m.Store != nil {
+		_ = m.Store.SaveQuota(m.AccountID, *usage)
 	}
 	claims, e := DecodeAndValidateJWT(tok, m.Guardian, time.Now(), 120*time.Second)
 	if e != nil {
@@ -528,18 +541,18 @@ func hawkHeader(method string, u *url.URL, body []byte, session string) (string,
 	}
 	return h + fmt.Sprintf(`, mac="%s"`, signature), nil
 }
-func (m *Manager) jsonRequest(ctx context.Context, method, endpoint string, body any, auth string) (map[string]any, error) {
+func (m *Manager) jsonRequestWithHeader(ctx context.Context, method, endpoint string, body any, auth string) (map[string]any, http.Header, error) {
 	var raw []byte
 	var e error
 	if body != nil {
 		raw, e = json.Marshal(body)
 		if e != nil {
-			return nil, e
+			return nil, nil, e
 		}
 	}
 	req, e := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(raw))
 	if e != nil {
-		return nil, e
+		return nil, nil, e
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", userAgentFor(endpoint))
@@ -553,21 +566,26 @@ func (m *Manager) jsonRequest(ctx context.Context, method, endpoint string, body
 	}
 	resp, e := m.Client.Do(req)
 	if e != nil {
-		return nil, e
+		return nil, nil, e
 	}
 	defer resp.Body.Close()
 	b, e := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if e != nil {
-		return nil, e
+		return nil, nil, e
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &httpError{resp.StatusCode, retryAfter(resp.Header.Get("Retry-After")), fmt.Sprintf("upstream HTTP %d", resp.StatusCode)}
+		return nil, resp.Header, &httpError{resp.StatusCode, retryAfter(resp.Header.Get("Retry-After")), fmt.Sprintf("upstream HTTP %d", resp.StatusCode)}
 	}
 	var v map[string]any
 	if json.Unmarshal(b, &v) != nil {
-		return nil, errors.New("upstream returned invalid JSON")
+		return nil, resp.Header, errors.New("upstream returned invalid JSON")
 	}
-	return v, nil
+	return v, resp.Header, nil
+}
+
+func (m *Manager) jsonRequest(ctx context.Context, method, endpoint string, body any, auth string) (map[string]any, error) {
+	v, _, err := m.jsonRequestWithHeader(ctx, method, endpoint, body, auth)
+	return v, err
 }
 func retryAfter(v string) time.Duration {
 	if v == "" {
@@ -665,16 +683,53 @@ func (m *Manager) authorize(ctx context.Context, session string) (string, error)
 	}
 	return access, nil
 }
-func (m *Manager) guardianToken(ctx context.Context, access string) (string, error) {
-	v, e := m.jsonRequest(ctx, "GET", m.Guardian+"/api/v1/fpn/token", nil, "Bearer "+access)
+func (m *Manager) guardianToken(ctx context.Context, access string) (string, *Usage, error) {
+	v, h, e := m.jsonRequestWithHeader(ctx, "GET", m.Guardian+"/api/v1/fpn/token", nil, "Bearer "+access)
 	if e != nil {
-		return "", e
+		return "", nil, e
 	}
 	t, ok := v["token"].(string)
 	if !ok || t == "" {
-		return "", errors.New("token missing in Guardian response")
+		return "", nil, errors.New("token missing in Guardian response")
 	}
-	return t, nil
+	return t, parseQuotaHeader(h), nil
+}
+
+func parseQuotaHeader(h http.Header) *Usage {
+	if h == nil {
+		return nil
+	}
+	u := &Usage{}
+	hasHeader := false
+	if v := h.Get("X-Quota-Unlimited"); v != "" {
+		hasHeader = true
+		if b, e := strconv.ParseBool(v); e == nil {
+			u.Unlimited = &b
+			if b {
+				return u
+			}
+		}
+	}
+	if v := h.Get("X-Quota-Limit"); v != "" {
+		hasHeader = true
+		if limit, e := strconv.Atoi(v); e == nil && limit >= 0 {
+			u.Limit = &limit
+		}
+	}
+	if v := h.Get("X-Quota-Remaining"); v != "" {
+		hasHeader = true
+		if remaining, e := strconv.Atoi(v); e == nil && remaining >= 0 {
+			u.Remaining = &remaining
+		}
+	}
+	if v := h.Get("X-Quota-Reset"); v != "" {
+		hasHeader = true
+		u.Reset = v
+	}
+	if !hasHeader {
+		return nil
+	}
+	return u
 }
 func (m *Manager) destroy(ctx context.Context, access string) {
 	c, cancel := context.WithTimeout(ctx, 5*time.Second)

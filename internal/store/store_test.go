@@ -81,13 +81,13 @@ func TestReopenIsIdempotent(t *testing.T) {
 	}
 	defer d2.Close()
 
-	// user_version should still be 1.
+	// user_version should still be CurrentSchemaVersion.
 	var ver int
 	if err := d2.db.QueryRowContext(context.Background(), "PRAGMA user_version").Scan(&ver); err != nil {
 		t.Fatal(err)
 	}
-	if ver != 1 {
-		t.Fatalf("user_version after reopen=%d, want 1", ver)
+	if ver != CurrentSchemaVersion {
+		t.Fatalf("user_version after reopen=%d, want %d", ver, CurrentSchemaVersion)
 	}
 }
 
@@ -511,5 +511,85 @@ func TestUpsertAccountReturnsTheUidRowIDOnConflict(t *testing.T) {
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestQuotaCRUDAndCascade(t *testing.T) {
+	root := tmpRoot(t)
+	d, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	acc := Account{
+		UID:          "99999999999999999999999999999999",
+		Email:        "nine@example.com",
+		SessionToken: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Enabled:      true,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	tx, err := d.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := d.UpsertAccount(ctx, tx, acc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	limit := 53687091200
+	remaining := 42949672960
+	resetTime := "2026-11-01T00:00:00Z"
+	q := Quota{
+		AccountID:      id,
+		Unlimited:      false,
+		LimitBytes:     &limit,
+		RemainingBytes: &remaining,
+		ResetTime:      resetTime,
+		UpdatedAt:      time.Now(),
+	}
+
+	if err := d.UpsertQuota(ctx, nil, q); err != nil {
+		t.Fatalf("upsert quota: %v", err)
+	}
+
+	got, found, err := d.GetQuota(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("get quota: found=%v, err=%v", found, err)
+	}
+	if got.RemainingBytes == nil || *got.RemainingBytes != remaining {
+		t.Fatalf("remaining=%v, want %d", got.RemainingBytes, remaining)
+	}
+
+	list, err := d.ListQuotas(ctx)
+	if err != nil {
+		t.Fatalf("list quotas: %v", err)
+	}
+	if len(list) != 1 || list[id].ResetTime != resetTime {
+		t.Fatalf("unexpected list: %+v", list)
+	}
+
+	// Cascade delete
+	tx, err = d.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.DeleteAccount(ctx, tx, acc.UID); err != nil {
+		t.Fatal(err)
+	}
+	_ = tx.Commit()
+
+	_, found, err = d.GetQuota(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("expected quota to be cascaded on account deletion")
 	}
 }

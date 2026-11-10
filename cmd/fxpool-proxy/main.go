@@ -164,6 +164,13 @@ func run(argv []string) int {
 		f.StringVar(&refreshUID, "uid", "", "account uid (multi-account mode)")
 		f.BoolVar(&refreshAll, "all", false, "refresh all accounts (multi-account mode)")
 	}
+	usageUID, usageAll, usageRefresh, usageJSON := "", false, false, false
+	if cmd == "usage" {
+		f.StringVar(&usageUID, "uid", "", "account uid (multi-account mode)")
+		f.BoolVar(&usageAll, "all", false, "query all accounts (multi-account mode)")
+		f.BoolVar(&usageRefresh, "refresh", false, "force live query to Guardian instead of cached quota")
+		f.BoolVar(&usageJSON, "json", false, "output JSON")
+	}
 	if cmd == "login" {
 		f.StringVar(&loginEmail, "email", "", "Firefox Account email")
 		f.BoolVar(&noVerify, "no-verify", false, "publish without Guardian refresh")
@@ -223,7 +230,7 @@ func run(argv []string) int {
 	case "token-refresh":
 		return cmdRefresh(c, force, refreshUID, refreshAll)
 	case "usage":
-		return cmdUsage(c)
+		return cmdUsage(c, usageUID, usageAll, usageRefresh, usageJSON)
 	case "how-to-token":
 		guide()
 		return 0
@@ -532,7 +539,33 @@ func cmdRefresh(c *config, force bool, uid string, all bool) int {
 	fmt.Printf("[+] refreshed; seconds_left=%d\n", int64(claims.Expires)-time.Now().Unix())
 	return 0
 }
-func cmdUsage(c *config) int {
+
+type usageRow struct {
+	UID            string `json:"uid"`
+	Email          string `json:"email"`
+	Enabled        bool   `json:"enabled"`
+	Unlimited      bool   `json:"unlimited"`
+	LimitBytes     *int   `json:"limit_bytes,omitempty"`
+	RemainingBytes *int   `json:"remaining_bytes,omitempty"`
+	ResetTime      string `json:"reset_time,omitempty"`
+	Cached         bool   `json:"cached"`
+	Error          string `json:"error,omitempty"`
+}
+
+func formatBytes(b int) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func cmdUsage(c *config, uid string, all, refresh, asJSON bool) int {
 	// Explicit JWT mode: bypass the account DB.
 	if strings.TrimSpace(c.proxyPass) != "" {
 		u, e := manager(c).Usage(context.Background())
@@ -550,19 +583,177 @@ func cmdUsage(c *config) int {
 			return 1
 		}
 		defer db.Close()
-		m, _, err := managerWithDB(c, db, "")
+		ctx := context.Background()
+		accs, err := db.ListAccounts(ctx)
 		if err != nil {
 			safeError(err)
 			return 1
 		}
-		u, e := m.Usage(context.Background())
+		if len(accs) == 0 {
+			safeError(errors.New("no accounts in database; import credentials first"))
+			return 1
+		}
+
+		if all {
+			quotas, _ := db.ListQuotas(ctx)
+			var rows []usageRow
+			totalLimit := 0
+			totalRemaining := 0
+			hasTotals := false
+
+			for _, a := range accs {
+				row := usageRow{UID: a.UID, Email: a.Email, Enabled: a.Enabled}
+				q, hasQuota := quotas[a.ID]
+				needLive := refresh || !hasQuota
+
+				if needLive {
+					if !a.Enabled {
+						row.Error = "account disabled"
+					} else {
+						m, _, mErr := managerWithDB(c, db, a.UID)
+						if mErr != nil {
+							row.Error = mErr.Error()
+						} else {
+							u, uErr := m.Usage(ctx)
+							if uErr != nil {
+								row.Error = uErr.Error()
+							} else {
+								row.Unlimited = u.Unlimited != nil && *u.Unlimited
+								row.LimitBytes = u.Limit
+								row.RemainingBytes = u.Remaining
+								row.ResetTime = u.Reset
+								row.Cached = false
+							}
+						}
+					}
+				} else {
+					row.Unlimited = q.Unlimited
+					row.LimitBytes = q.LimitBytes
+					row.RemainingBytes = q.RemainingBytes
+					row.ResetTime = q.ResetTime
+					row.Cached = true
+				}
+
+				if row.LimitBytes != nil && row.RemainingBytes != nil {
+					totalLimit += *row.LimitBytes
+					totalRemaining += *row.RemainingBytes
+					hasTotals = true
+				}
+				rows = append(rows, row)
+			}
+
+			if asJSON {
+				printJSON(rows)
+				return 0
+			}
+
+			fmt.Printf("%-32s  %-30s  %-8s  %-23s  %s\n", "UID", "EMAIL", "STATUS", "REMAINING / LIMIT", "RESET")
+			fmt.Println(strings.Repeat("-", 110))
+			for _, r := range rows {
+				status := "enabled"
+				if !r.Enabled {
+					status = "disabled"
+				}
+				quotaStr := "unknown"
+				if r.Error != "" {
+					quotaStr = fmt.Sprintf("err: %s", r.Error)
+				} else if r.Unlimited {
+					quotaStr = "unlimited"
+				} else if r.RemainingBytes != nil && r.LimitBytes != nil {
+					cachedTag := ""
+					if r.Cached {
+						cachedTag = " (cached)"
+					}
+					quotaStr = fmt.Sprintf("%s / %s%s", formatBytes(*r.RemainingBytes), formatBytes(*r.LimitBytes), cachedTag)
+				}
+				reset := r.ResetTime
+				if reset == "" {
+					reset = "-"
+				}
+				fmt.Printf("%-32s  %-30s  %-8s  %-23s  %s\n", r.UID, r.Email, status, quotaStr, reset)
+			}
+			if hasTotals {
+				fmt.Println(strings.Repeat("-", 110))
+				fmt.Printf("Total: %d accounts | Remaining: %s | Limit: %s\n", len(rows), formatBytes(totalRemaining), formatBytes(totalLimit))
+			}
+			return 0
+		}
+
+		// Single account resolution
+		targetUID := uid
+		if targetUID == "" {
+			if len(accs) == 1 {
+				targetUID = accs[0].UID
+			} else {
+				safeError(errors.New("multiple accounts present; specify --all or --uid <uid>"))
+				return 1
+			}
+		}
+
+		var targetAcc *storepkg.Account
+		for i := range accs {
+			if accs[i].UID == targetUID {
+				targetAcc = &accs[i]
+				break
+			}
+		}
+		if targetAcc == nil {
+			safeError(fmt.Errorf("account %q not found", targetUID))
+			return 1
+		}
+
+		if !refresh {
+			q, found, _ := db.GetQuota(ctx, targetAcc.ID)
+			if found {
+				u := token.Usage{
+					Unlimited: &q.Unlimited,
+					Limit:     q.LimitBytes,
+					Remaining: q.RemainingBytes,
+					Reset:     q.ResetTime,
+				}
+				if asJSON {
+					printJSON(u)
+				} else {
+					lim := "-"
+					if u.Limit != nil {
+						lim = formatBytes(*u.Limit)
+					}
+					rem := "-"
+					if u.Remaining != nil {
+						rem = formatBytes(*u.Remaining)
+					}
+					fmt.Printf("uid: %s (cached)\nemail: %s\nremaining: %s\nlimit: %s\nreset: %s\n", targetAcc.UID, targetAcc.Email, rem, lim, u.Reset)
+				}
+				return 0
+			}
+		}
+
+		m, _, err := managerWithDB(c, db, targetUID)
+		if err != nil {
+			safeError(err)
+			return 1
+		}
+		u, e := m.Usage(ctx)
 		if e != nil {
 			safeError(e)
 			return 1
 		}
-		printJSON(u)
+		if asJSON {
+			printJSON(u)
+		} else {
+			lim := "-"
+			if u.Limit != nil {
+				lim = formatBytes(*u.Limit)
+			}
+			rem := "-"
+			if u.Remaining != nil {
+				rem = formatBytes(*u.Remaining)
+			}
+			fmt.Printf("uid: %s\nemail: %s\nremaining: %s\nlimit: %s\nreset: %s\n", targetAcc.UID, targetAcc.Email, rem, lim, u.Reset)
+		}
 		return 0
 	}
+
 	u, e := manager(c).Usage(context.Background())
 	if e != nil {
 		safeError(e)
@@ -1236,18 +1427,26 @@ func cmdAccounts(c *config, subArgs []string) int {
 			safeError(err)
 			return 1
 		}
+		quotas, _ := db.ListQuotas(ctx)
 		if listJSON {
 			type row struct {
-				UID     string `json:"uid"`
-				Email   string `json:"email"`
-				Enabled bool   `json:"enabled"`
-				Result  string `json:"refresh_result"`
-				Label   string `json:"label"`
+				UID            string `json:"uid"`
+				Email          string `json:"email"`
+				Enabled        bool   `json:"enabled"`
+				Result         string `json:"refresh_result"`
+				Label          string `json:"label"`
+				LimitBytes     *int   `json:"limit_bytes,omitempty"`
+				RemainingBytes *int   `json:"remaining_bytes,omitempty"`
 			}
 			var rows []row
 			for _, a := range accs {
 				rs, _ := db.GetRefreshState(ctx, a.ID)
-				rows = append(rows, row{a.UID, a.Email, a.Enabled, rs.Result, a.Label})
+				r := row{UID: a.UID, Email: a.Email, Enabled: a.Enabled, Result: rs.Result, Label: a.Label}
+				if q, ok := quotas[a.ID]; ok {
+					r.LimitBytes = q.LimitBytes
+					r.RemainingBytes = q.RemainingBytes
+				}
+				rows = append(rows, r)
 			}
 			printJSON(rows)
 			return 0
@@ -1268,7 +1467,11 @@ func cmdAccounts(c *config, subArgs []string) int {
 			if !a.Enabled {
 				enabled = "disabled"
 			}
-			fmt.Printf("uid=%-32s %s  state=%-20s %s\n", a.UID, enabled, rs.Result, ttl)
+			quotaInfo := ""
+			if q, ok := quotas[a.ID]; ok && q.RemainingBytes != nil && q.LimitBytes != nil {
+				quotaInfo = fmt.Sprintf("quota=%s/%s", formatBytes(*q.RemainingBytes), formatBytes(*q.LimitBytes))
+			}
+			fmt.Printf("uid=%-32s %s  state=%-20s %-11s %s\n", a.UID, enabled, rs.Result, ttl, quotaInfo)
 		}
 		return 0
 

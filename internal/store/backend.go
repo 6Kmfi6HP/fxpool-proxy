@@ -113,6 +113,50 @@ func (b *ManagerBackend) Reject(accountID int64, digest string) error {
 	return tx.Commit()
 }
 
+// SaveQuota persists a quota row for the account.
+func (b *ManagerBackend) SaveQuota(accountID int64, u token.Usage) error {
+	ctx := context.Background()
+	tx, err := b.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	unlimited := false
+	if u.Unlimited != nil {
+		unlimited = *u.Unlimited
+	}
+	q := Quota{
+		AccountID:      accountID,
+		Unlimited:      unlimited,
+		LimitBytes:     u.Limit,
+		RemainingBytes: u.Remaining,
+		ResetTime:      u.Reset,
+		UpdatedAt:      time.Now(),
+	}
+	if err := b.DB.UpsertQuota(ctx, tx, q); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// LoadQuota returns the stored quota for the account.
+func (b *ManagerBackend) LoadQuota(accountID int64) (token.Usage, error) {
+	ctx := context.Background()
+	q, found, err := b.DB.GetQuota(ctx, accountID)
+	if err != nil {
+		return token.Usage{}, err
+	}
+	if !found {
+		return token.Usage{}, errors.New("no quota stored")
+	}
+	return token.Usage{
+		Unlimited: &q.Unlimited,
+		Limit:     q.LimitBytes,
+		Remaining: q.RemainingBytes,
+		Reset:     q.ResetTime,
+	}, nil
+}
+
 // PublishCredentials upserts the account by UID and resets its token and state
 // in a single transaction.
 func (b *ManagerBackend) PublishCredentials(c token.Credentials) (int64, error) {
