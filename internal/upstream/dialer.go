@@ -48,6 +48,35 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// CloseWrite forwards a TCP half-close on plain connections, but is a no-op
+// when wrapping *tls.Conn: sending TLS close_notify into an HTTP CONNECT proxy
+// causes proxies like Fastly to tear down the tunnel immediately before the
+// origin's response finishes arriving.
+func (c *bufferedConn) CloseWrite() error {
+	if _, ok := c.Conn.(*tls.Conn); ok {
+		return nil
+	}
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// CONNECTError reports an upstream CONNECT failure with its HTTP status.
+type CONNECTError struct {
+	Status int
+	Err    error
+}
+
+func (e *CONNECTError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("upstream CONNECT HTTP %d", e.Status)
+	}
+	return fmt.Sprintf("upstream CONNECT HTTP %d: %v", e.Status, e.Err)
+}
+func (e *CONNECTError) Unwrap() error       { return e.Err }
+func (e *CONNECTError) UpstreamStatus() int { return e.Status }
 func authority(host string, port int) string {
 	if strings.Contains(host, ":") {
 		return "[" + host + "]:" + strconv.Itoa(port)
@@ -129,13 +158,13 @@ func (d *Dialer) connectOnce(ctx context.Context, node serverlist.Node, targetHo
 	if resp.ContentLength > limit {
 		_ = resp.Body.Close()
 		conn.Close()
-		return nil, resp.StatusCode, errors.New("CONNECT response too large")
+		return nil, resp.StatusCode, &CONNECTError{Status: resp.StatusCode, Err: errors.New("CONNECT response too large")}
 	}
 	if resp.StatusCode != 200 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, limit+1))
 		_ = resp.Body.Close()
 		conn.Close()
-		return nil, resp.StatusCode, fmt.Errorf("upstream CONNECT HTTP %d", resp.StatusCode)
+		return nil, resp.StatusCode, &CONNECTError{Status: resp.StatusCode}
 	}
 	// A successful CONNECT response transfers ownership of the underlying
 	// connection to the caller. Closing resp.Body here closes that tunnel.

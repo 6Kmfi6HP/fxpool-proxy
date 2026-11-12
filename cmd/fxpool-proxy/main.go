@@ -40,8 +40,13 @@ type config struct {
 	root, guardian, serverURL, proxyPass, fxaToken, bind, advertise, rotator, httpRotator, rotateMode, countries, country, authUser, authPass, firefoxVersion, clientCountry, masqueURI string
 	fxaBase                                                                                                                                                                             string
 	accountMode                                                                                                                                                                         string
+	clockURL, probeTarget, probePorts                                                                                                                                                   string
 	socksBase, httpBase, udpBase, limit                                                                                                                                                 int
-	forceSync, allowNoToken, noSocks, noHTTP, requireAuth, allowOpen, includeLocked, recommended                                                                                        bool
+	maxConns, udpMaxTunnelsClient                                                                                                                                                       int
+	idleTimeout, udpIdleTimeout, probeTimeout                                                                                                                                           time.Duration
+	quotaMaxAge, quotaCooldown, quotaRefreshInterval                                                                                                                                    time.Duration
+	quotaMargin                                                                                                                                                                         int64
+	forceSync, allowNoToken, noSocks, noHTTP, requireAuth, allowOpen, includeLocked, recommended, quotaAware                                                                            bool
 }
 
 type endpoint struct {
@@ -75,7 +80,11 @@ func flagsFor(name string) (*flag.FlagSet, *config) {
 	f.IntVar(&c.socksBase, "socks-base", 21000, "first per-node SOCKS port")
 	f.IntVar(&c.httpBase, "http-base", 31000, "first per-node HTTP port")
 	f.IntVar(&c.udpBase, "udp-base", 41000, "first per-node UDP relay port (SOCKS5 UDP ASSOCIATE via MASQUE)")
+	f.DurationVar(&c.udpIdleTimeout, "udp-idle-timeout", 2*time.Minute, "idle timeout for SOCKS5 UDP tunnels (0 disables)")
+	f.IntVar(&c.udpMaxTunnelsClient, "udp-max-tunnels-client", 64, "maximum concurrent UDP tunnels per client (0 = unlimited)")
 	f.IntVar(&c.limit, "limit", 0, "maximum node count")
+	f.DurationVar(&c.idleTimeout, "idle-timeout", 10*time.Minute, "idle timeout for relayed TCP connections (0 disables)")
+	f.IntVar(&c.maxConns, "max-conns", 512, "maximum concurrent client connections per server (0 = unlimited)")
 	f.StringVar(&c.countries, "countries", env("COUNTRIES", ""), "comma-separated countries")
 	f.BoolVar(&c.noSocks, "no-socks", false, "disable SOCKS listeners")
 	f.BoolVar(&c.noHTTP, "no-http", false, "disable HTTP listeners")
@@ -95,12 +104,21 @@ func flagsFor(name string) (*flag.FlagSet, *config) {
 	f.BoolVar(&c.includeLocked, "include-locked", false, "include locked records diagnostically")
 	f.BoolVar(&c.recommended, "recommended", false, "use REC records only")
 	f.StringVar(&c.accountMode, "account-mode", env("ACCOUNT_MODE", ""), "multi-account token selection mode (rr)")
+	f.StringVar(&c.clockURL, "clock-url", "https://vpn.mozilla.org", "trusted HTTPS URL for clock-check")
+	f.BoolVar(&c.quotaAware, "quota-aware", false, "opt-in: prefer accounts with known remaining quota (default round-robin)")
+	f.DurationVar(&c.quotaMaxAge, "quota-max-age", 15*time.Minute, "trust window for a quota snapshot (must be > 0 with --quota-aware)")
+	f.Int64Var(&c.quotaMargin, "quota-margin-bytes", 0, "minimum remaining bytes required to select an account")
+	f.DurationVar(&c.quotaCooldown, "quota-cooldown", 15*time.Minute, "skip duration for exhausted accounts without a reset time")
+	f.DurationVar(&c.quotaRefreshInterval, "quota-refresh-interval", 15*time.Minute, "background quota refresh interval when --quota-aware is set")
+	f.StringVar(&c.probeTarget, "probe-target", "1.1.1.1", "UDP probe target host")
+	f.StringVar(&c.probePorts, "probe-ports", "53,80,443,3478,8080,8443,123", "comma-separated UDP ports for udp-probe")
+	f.DurationVar(&c.probeTimeout, "probe-timeout", 3*time.Second, "per-port timeout for probe/udp-probe")
 	return f, c
 }
 func main() { os.Exit(run(os.Args[1:])) }
 func run(argv []string) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: fxpool-proxy <sync|token-status|token-refresh|usage|how-to-token|probe|run|login|export-credentials|import-credentials|accounts>")
+		fmt.Fprintln(os.Stderr, "usage: fxpool-proxy <sync|token-status|token-refresh|usage|how-to-token|probe|udp-probe|clock-check|run|login|export-credentials|import-credentials|accounts>")
 		return 2
 	}
 	cmd := argv[0]
@@ -236,6 +254,10 @@ func run(argv []string) int {
 		return 0
 	case "probe":
 		return cmdProbe(c)
+	case "udp-probe":
+		return cmdUDPProbe(c)
+	case "clock-check":
+		return cmdClockCheck(c)
 	case "login":
 		return cmdLogin(c, loginEmail, noVerify, loginTOTP)
 	case "run":
@@ -597,9 +619,6 @@ func cmdUsage(c *config, uid string, all, refresh, asJSON bool) int {
 		if all {
 			quotas, _ := db.ListQuotas(ctx)
 			var rows []usageRow
-			totalLimit := 0
-			totalRemaining := 0
-			hasTotals := false
 
 			for _, a := range accs {
 				row := usageRow{UID: a.UID, Email: a.Email, Enabled: a.Enabled}
@@ -634,11 +653,6 @@ func cmdUsage(c *config, uid string, all, refresh, asJSON bool) int {
 					row.Cached = true
 				}
 
-				if row.LimitBytes != nil && row.RemainingBytes != nil {
-					totalLimit += *row.LimitBytes
-					totalRemaining += *row.RemainingBytes
-					hasTotals = true
-				}
 				rows = append(rows, row)
 			}
 
@@ -672,10 +686,8 @@ func cmdUsage(c *config, uid string, all, refresh, asJSON bool) int {
 				}
 				fmt.Printf("%-32s  %-30s  %-8s  %-23s  %s\n", r.UID, r.Email, status, quotaStr, reset)
 			}
-			if hasTotals {
-				fmt.Println(strings.Repeat("-", 110))
-				fmt.Printf("Total: %d accounts | Remaining: %s | Limit: %s\n", len(rows), formatBytes(totalRemaining), formatBytes(totalLimit))
-			}
+			fmt.Println(strings.Repeat("-", 110))
+			fmt.Printf("%d accounts (per-account quotas are not summed)\n", len(rows))
 			return 0
 		}
 
@@ -923,6 +935,38 @@ func cmdExport(c *config, out, profile, firefoxDir string, listOnly, doImport, n
 	}
 	return 0
 }
+
+// probeSource is one geo observation made through the node. IPs are omitted
+// on purpose: reports are meant to be safe to paste into an issue.
+type probeSource struct {
+	Source  string `json:"source"`
+	OK      bool   `json:"ok"`
+	Country string `json:"country,omitempty"`
+	Region  string `json:"region,omitempty"`
+	City    string `json:"city,omitempty"`
+	Org     string `json:"org,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type probeReport struct {
+	NodeCountry   string        `json:"node_country"`
+	NodeCity      string        `json:"node_city"`
+	NodeHostname  string        `json:"node_hostname"`
+	Expected      string        `json:"expected_country,omitempty"`
+	Sources       []probeSource `json:"sources"`
+	IPv4Egress    bool          `json:"ipv4_egress"`
+	IPv6Egress    bool          `json:"ipv6_egress"`
+	IPv4Error     string        `json:"ipv4_error,omitempty"`
+	IPv6Error     string        `json:"ipv6_error,omitempty"`
+	Warnings      []string      `json:"warnings,omitempty"`
+	GeoDisclaimer string        `json:"geo_disclaimer"`
+}
+
+// probeTunnelOpener is the subset of upstream.Dialer needed by probe.
+type probeTunnelOpener interface {
+	Open(context.Context, serverlist.Node, string, int) (net.Conn, error)
+}
+
 func cmdProbe(c *config) int {
 	nodes, e := store(c).Fetch(context.Background(), false, c.firefoxVersion, c.clientCountry, false)
 	if e != nil {
@@ -941,45 +985,367 @@ func cmdProbe(c *config) int {
 		fmt.Fprintln(os.Stderr, "no nodes")
 		return 1
 	}
-	d := &upstream.Dialer{Tokens: manager(c)}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
-	conn, e := d.Open(ctx, *chosen, "ipinfo.io", 80)
+	src, closeSrc, e := probeTokenSource(c)
 	if e != nil {
 		safeError(e)
 		return 1
 	}
-	defer conn.Close()
-	_, _ = io.WriteString(conn, "GET /json HTTP/1.1\r\nHost: ipinfo.io\r\nAccept: application/json\r\nConnection: close\r\n\r\n")
-	resp, e := http.ReadResponse(bufioNew(conn), &http.Request{Method: "GET"})
-	if e != nil || resp.StatusCode != 200 {
-		safeError(errors.New("probe response failed"))
+	defer closeSrc()
+	d := &upstream.Dialer{Tokens: src}
+	return runProbe(context.Background(), d, *chosen, c.country)
+}
+
+// runProbe samples two independent geo sources and both address families. A
+// country mismatch is a warning, never an automatic node rejection.
+func runProbe(parent context.Context, d probeTunnelOpener, node serverlist.Node, expected string) int {
+	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
+	defer cancel()
+	rep := probeReport{
+		NodeCountry:   node.Country,
+		NodeCity:      node.City,
+		NodeHostname:  node.Hostname,
+		Expected:      expected,
+		GeoDisclaimer: "geolocation databases disagree and can lag; mismatches are warnings only",
+	}
+	if rep.Expected == "" && node.Country != "REC" {
+		rep.Expected = node.Country
+	}
+	for _, src := range []struct {
+		name, host, path string
+	}{
+		{"ipinfo.io", "ipinfo.io", "/json"},
+		{"ifconfig.co", "ifconfig.co", "/json"},
+	} {
+		body, e := probeGET(ctx, d, node, src.host, 80, src.path)
+		if e != nil {
+			rep.Sources = append(rep.Sources, probeSource{Source: src.name, Error: probeError(e)})
+			continue
+		}
+		var v map[string]any
+		if json.Unmarshal(body, &v) != nil {
+			rep.Sources = append(rep.Sources, probeSource{Source: src.name, Error: "non-JSON response"})
+			continue
+		}
+		rep.Sources = append(rep.Sources, geoSource(src.name, v))
+	}
+	for _, fam := range []struct {
+		family, host string
+		dst          *bool
+		errDst       *string
+	}{
+		{"ipv4", "ipv4.icanhazip.com", &rep.IPv4Egress, &rep.IPv4Error},
+		{"ipv6", "ipv6.icanhazip.com", &rep.IPv6Egress, &rep.IPv6Error},
+	} {
+		body, e := probeGET(ctx, d, node, fam.host, 80, "/")
+		if e != nil {
+			*fam.errDst = probeError(e)
+			continue
+		}
+		ip := net.ParseIP(strings.TrimSpace(string(body)))
+		if ip == nil || ipFamily(ip) != fam.family {
+			*fam.errDst = "unexpected address family"
+			continue
+		}
+		*fam.dst = true
+	}
+	rep.Warnings = probeWarnings(rep.Expected, rep.Sources)
+	ok := rep.IPv4Egress || rep.IPv6Egress
+	for _, src := range rep.Sources {
+		if src.OK {
+			ok = true
+			break
+		}
+	}
+	printJSON(rep)
+	if !ok {
 		return 1
+	}
+	return 0
+}
+
+func ipFamily(ip net.IP) string {
+	if ip.To4() != nil {
+		return "ipv4"
+	}
+	return "ipv6"
+}
+
+// geoSource maps the two supported JSON shapes to a credential-free summary.
+func geoSource(name string, v map[string]any) probeSource {
+	src := probeSource{Source: name, OK: true}
+	pick := func(keys ...string) string {
+		for _, k := range keys {
+			if s, ok := v[k].(string); ok && s != "" {
+				return s
+			}
+		}
+		return ""
+	}
+	switch name {
+	case "ifconfig.co":
+		src.Country = pick("country_iso", "country")
+		src.Region = pick("region_name", "region")
+		src.City = pick("city")
+		src.Org = pick("asn_org", "asn")
+	default:
+		src.Country = pick("country")
+		src.Region = pick("region")
+		src.City = pick("city")
+		src.Org = pick("org")
+	}
+	return src
+}
+
+// probeWarnings reports disagreements without rejecting anything.
+func probeWarnings(expected string, sources []probeSource) []string {
+	var warnings []string
+	seen := map[string]bool{}
+	var countries []string
+	for _, src := range sources {
+		c := strings.ToUpper(strings.TrimSpace(src.Country))
+		if !src.OK || c == "" {
+			continue
+		}
+		if !seen[c] {
+			seen[c] = true
+			countries = append(countries, c)
+		}
+	}
+	if len(countries) > 1 {
+		warnings = append(warnings, "geo sources disagree on country: "+strings.Join(countries, ", "))
+	}
+	if expected = strings.ToUpper(strings.TrimSpace(expected)); expected != "" && expected != "REC" {
+		for _, c := range countries {
+			if c != expected {
+				warnings = append(warnings, fmt.Sprintf("expected node country %s but observed %s (geo database or egress mapping; warning only)", expected, c))
+			}
+		}
+	}
+	return warnings
+}
+
+// probeGET makes one HTTP/1.1 GET through a CONNECT tunnel and returns the
+// response body.
+func probeGET(ctx context.Context, d probeTunnelOpener, node serverlist.Node, host string, port int, path string) ([]byte, error) {
+	conn, e := d.Open(ctx, node, host, port)
+	if e != nil {
+		return nil, e
+	}
+	defer conn.Close()
+	req := "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nAccept: application/json\r\nUser-Agent: fxpool-proxy-probe/1\r\nConnection: close\r\n\r\n"
+	if _, e = io.WriteString(conn, req); e != nil {
+		return nil, e
+	}
+	resp, e := http.ReadResponse(bufioNew(conn), &http.Request{Method: http.MethodGet})
+	if e != nil {
+		return nil, e
 	}
 	defer resp.Body.Close()
 	b, e := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if e != nil {
-		safeError(e)
-		return 1
+		return nil, e
 	}
-	var v map[string]any
-	if json.Unmarshal(b, &v) != nil {
-		fmt.Println("probe succeeded")
-		return 0
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, host)
 	}
-	safe := map[string]any{}
-	for _, k := range []string{"country", "region", "city", "org"} {
-		if val, ok := v[k]; ok {
-			safe[k] = val
-		}
-	}
-	printJSON(safe)
-	return 0
+	return b, nil
 }
 
 type readerConn struct{ net.Conn }
 
 func bufioNew(c net.Conn) *bufio.Reader { return bufio.NewReader(c) }
+
+// udpProbePort is one entry in a udp-probe report. Tunnel records whether the
+// MASQUE proxy accepted CONNECT-UDP for this port; Reply records whether any
+// datagram came back within the timeout. A tunnel can be established with no
+// reply (the target may not speak on that port).
+type udpProbePort struct {
+	Port     int    `json:"port"`
+	Tunnel   string `json:"tunnel"`
+	TunnelMS int64  `json:"tunnel_ms"`
+	Reply    bool   `json:"reply"`
+	Error    string `json:"error,omitempty"`
+}
+
+type udpProbeReport struct {
+	Hostname string         `json:"hostname"`
+	Port     int            `json:"masque_port"`
+	Target   string         `json:"target"`
+	Ports    []udpProbePort `json:"ports"`
+	Note     string         `json:"note"`
+}
+
+// cmdUDPProbe measures CONNECT-UDP admission (and best-effort replies) per
+// target port on one authorized MASQUE endpoint. The report contains no
+// credentials.
+func cmdUDPProbe(c *config) int {
+	if strings.TrimSpace(c.masqueURI) == "" {
+		safeError(errors.New("udp-probe requires --masque-uri"))
+		return 2
+	}
+	node, e := masqueNodeFromURI(c.masqueURI)
+	if e != nil {
+		safeError(e)
+		return 2
+	}
+	ports, e := parseProbePorts(c.probePorts)
+	if e != nil {
+		safeError(e)
+		return 2
+	}
+	if c.probeTimeout <= 0 {
+		safeError(errors.New("--probe-timeout must be positive"))
+		return 2
+	}
+	src, closeSrc, e := probeTokenSource(c)
+	if e != nil {
+		safeError(e)
+		return 1
+	}
+	defer closeSrc()
+	d := &upstream.Dialer{Tokens: src}
+	report := udpProbeReport{
+		Hostname: node.Hostname,
+		Port:     node.Port,
+		Target:   c.probeTarget,
+		Note:     "Tunnel=established means CONNECT-UDP was accepted for this port; Reply means a datagram returned within the timeout. This is not an application-level reachability guarantee.",
+	}
+	established := 0
+	for _, port := range ports {
+		r := probeUDPPort(d, node, c.probeTarget, port, c.probeTimeout)
+		if r.Tunnel == "established" {
+			established++
+		}
+		report.Ports = append(report.Ports, r)
+	}
+	printJSON(report)
+	if established == 0 {
+		return 1
+	}
+	return 0
+}
+
+func parseProbePorts(v string) ([]int, error) {
+	var out []int
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		p, e := strconv.Atoi(part)
+		if e != nil || p < 1 || p > 65535 {
+			return nil, fmt.Errorf("invalid probe port %q", part)
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no probe ports configured")
+	}
+	return out, nil
+}
+
+// probeTokenSource reuses the account pool in multi-account mode, otherwise
+// the single-account manager.
+func probeTokenSource(c *config) (upstream.TokenSource, func(), error) {
+	if c.accountMode != "" && strings.TrimSpace(c.proxyPass) == "" {
+		db, err := openAccountDB(c)
+		if err != nil {
+			return nil, nil, err
+		}
+		p, err := accounts.NewPool(context.Background(), db, c.root, c.guardian, c.fxaBase, nil)
+		if err != nil {
+			_ = db.Close()
+			return nil, nil, err
+		}
+		if p.Len() == 0 {
+			_ = db.Close()
+			return nil, nil, errors.New("no enabled accounts in pool; import credentials first")
+		}
+		return p, func() { _ = db.Close() }, nil
+	}
+	return manager(c), func() {}, nil
+}
+
+// cmdClockCheck reports the trusted server's clock offset from this machine's
+// clock. It never changes JWT validation.
+func cmdClockCheck(c *config) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	off, e := token.ServerDateOffset(ctx, &http.Client{Timeout: 10 * time.Second}, c.clockURL)
+	if e != nil {
+		safeError(fmt.Errorf("clock check: %w", e))
+		return 1
+	}
+	printJSON(map[string]any{
+		"url":                c.clockURL,
+		"offset_seconds":     int64(off / time.Second),
+		"resolution_seconds": 1,
+		"note":               "positive means the trusted server clock is ahead; observation only, signed JWT exp is never extended",
+	})
+	return 0
+}
+
+type udpOpener interface {
+	OpenUDP(context.Context, serverlist.Node, string, int) (net.PacketConn, error)
+}
+
+func probeUDPPort(d udpOpener, node serverlist.Node, target string, port int, timeout time.Duration) udpProbePort {
+	r := udpProbePort{Port: port, Tunnel: "rejected"}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	start := time.Now()
+	pc, e := d.OpenUDP(ctx, node, target, port)
+	r.TunnelMS = time.Since(start).Milliseconds()
+	if e != nil {
+		r.Error = probeError(e)
+		return r
+	}
+	defer pc.Close()
+	r.Tunnel = "established"
+	payload := []byte{0, 0, 0, 0}
+	if port == 53 {
+		payload = dnsProbeQuery("example.com")
+	}
+	if _, e = pc.WriteTo(payload, nil); e != nil {
+		r.Error = probeError(e)
+		return r
+	}
+	_ = pc.SetReadDeadline(time.Now().Add(timeout))
+	buf := make([]byte, 1500)
+	n, _, e := pc.ReadFrom(buf)
+	if e != nil {
+		var ne net.Error
+		if errors.As(e, &ne) && ne.Timeout() {
+			return r // no reply within the timeout, tunnel still established
+		}
+		r.Error = probeError(e)
+		return r
+	}
+	r.Reply = n > 0
+	return r
+}
+
+func probeError(e error) string {
+	s := strings.ReplaceAll(e.Error(), "\n", " ")
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
+}
+
+// dnsProbeQuery builds a minimal DNS A query so port 53 can produce a reply.
+func dnsProbeQuery(name string) []byte {
+	b := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			continue
+		}
+		b = append(b, byte(len(label)))
+		b = append(b, label...)
+	}
+	b = append(b, 0x00, 0x00, 0x01, 0x00, 0x01)
+	return b
+}
 func cmdRun(c *config) int {
 	if e := validateRun(c); e != nil {
 		safeError(e)
@@ -1038,6 +1404,10 @@ func cmdRun(c *config) int {
 			safeError(e)
 			return 1
 		}
+		if c.quotaAware {
+			p.EnableQuotaPolicy(accounts.QuotaPolicy{MaxAge: c.quotaMaxAge, MarginBytes: c.quotaMargin, Cooldown: c.quotaCooldown})
+			go quotaLoop(ctx, p, c.quotaRefreshInterval)
+		}
 		tokenSource = p
 		go refreshLoopPool(ctx, p)
 	} else {
@@ -1057,6 +1427,22 @@ func cmdRun(c *config) int {
 		safeError(e)
 		return 1
 	}
+	var udpSrv *pool.UDPServer
+	var udpAddr string
+	if len(masqueNodes) > 0 {
+		udpSrv = pool.NewUDPServer(dial, masqueNodes)
+		udpSrv.IdleTimeout = c.udpIdleTimeout
+		udpSrv.MaxTunnelsPerClient = c.udpMaxTunnelsClient
+		udpSrv.Logf = serverLogf
+		udpListen := net.JoinHostPort(c.bind, strconv.Itoa(c.udpBase))
+		a, e := udpSrv.Listen(udpListen)
+		if e != nil {
+			safeError(e)
+			return 1
+		}
+		udpAddr = a.String()
+		defer func() { _ = udpSrv.Close() }()
+	}
 	var servers []*pool.Server
 	closeAll := func() {
 		for i := len(servers) - 1; i >= 0; i-- {
@@ -1066,7 +1452,7 @@ func cmdRun(c *config) int {
 	defer closeAll()
 	var eps []endpoint
 	for _, n := range nodes {
-		s := &pool.Server{Dialer: dial, Selector: pool.NewSelector([]serverlist.Node{n}, "rr"), Username: c.authUser, Password: c.authPass, AllowOpen: c.allowOpen}
+		s := &pool.Server{Dialer: dial, Selector: pool.NewSelector([]serverlist.Node{n}, "rr"), Username: c.authUser, Password: c.authPass, AllowOpen: c.allowOpen, UDPRelay: udpSrv, IdleTimeout: c.idleTimeout, MaxConns: c.maxConns, Logf: serverLogf}
 		ep := endpoint{node: n}
 		assigned := ports[n.StableID()]
 		if !c.noSocks {
@@ -1088,7 +1474,7 @@ func cmdRun(c *config) int {
 		servers = append(servers, s)
 		eps = append(eps, ep)
 	}
-	aggregate := &pool.Server{Dialer: dial, Selector: pool.NewSelector(nodes, c.rotateMode), Username: c.authUser, Password: c.authPass, AllowOpen: c.allowOpen}
+	aggregate := &pool.Server{Dialer: dial, Selector: pool.NewSelector(nodes, c.rotateMode), Username: c.authUser, Password: c.authPass, AllowOpen: c.allowOpen, UDPRelay: udpSrv, IdleTimeout: c.idleTimeout, MaxConns: c.maxConns, Logf: serverLogf}
 	if !disabled(c.rotator) && !c.recommended {
 		addr := c.rotator
 		if addr == "" {
@@ -1110,19 +1496,6 @@ func cmdRun(c *config) int {
 		}
 	}
 	servers = append(servers, aggregate)
-	var udpSrv *pool.UDPServer
-	var udpAddr string
-	if len(masqueNodes) > 0 {
-		udpSrv = pool.NewUDPServer(dial, masqueNodes)
-		udpListen := net.JoinHostPort(c.bind, strconv.Itoa(c.udpBase))
-		a, e := udpSrv.Listen(udpListen)
-		if e != nil {
-			safeError(e)
-			return 1
-		}
-		udpAddr = a.String()
-		defer func() { _ = udpSrv.Close() }()
-	}
 	if e = export(c, eps); e != nil {
 		safeError(e)
 		return 1
@@ -1138,6 +1511,27 @@ func cmdRun(c *config) int {
 func validateRun(c *config) error {
 	if c.limit < 0 {
 		return errors.New("--limit must be a positive integer")
+	}
+	if c.idleTimeout < 0 {
+		return errors.New("--idle-timeout must be zero or positive")
+	}
+	if c.maxConns < 0 {
+		return errors.New("--max-conns must be zero or positive")
+	}
+	if c.udpIdleTimeout < 0 {
+		return errors.New("--udp-idle-timeout must be zero or positive")
+	}
+	if c.udpMaxTunnelsClient < 0 {
+		return errors.New("--udp-max-tunnels-client must be zero or positive")
+	}
+	if c.quotaMargin < 0 {
+		return errors.New("--quota-margin-bytes must be zero or positive")
+	}
+	if c.quotaMaxAge < 0 || c.quotaCooldown < 0 || c.quotaRefreshInterval < 0 {
+		return errors.New("--quota-* durations must be zero or positive")
+	}
+	if c.quotaAware && c.quotaMaxAge <= 0 {
+		return errors.New("--quota-aware requires --quota-max-age > 0")
 	}
 	if c.noSocks && c.noHTTP {
 		return errors.New("--no-socks and --no-http cannot be used together")
@@ -1303,6 +1697,26 @@ func refreshLoop(ctx context.Context, m *token.Manager) {
 			return
 		case <-t.C:
 			_, _ = m.Ensure(ctx, false)
+		}
+	}
+}
+
+// quotaLoop keeps quota snapshots fresh when --quota-aware is enabled. The
+// first refresh runs immediately; errors are ignored and leave the previous
+// snapshot in place.
+func quotaLoop(ctx context.Context, p *accounts.Pool, interval time.Duration) {
+	p.RefreshQuotas(ctx)
+	if interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.RefreshQuotas(ctx)
 		}
 	}
 }
@@ -1526,6 +1940,9 @@ func cmdAccounts(c *config, subArgs []string) int {
 	}
 }
 func safeError(e error) { fmt.Fprintf(os.Stderr, "[!] %s\n", e.Error()) }
-func printJSON(v any)   { b, _ := json.MarshalIndent(v, "", "  "); fmt.Println(string(b)) }
+func serverLogf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "[!] "+format+"\n", args...)
+}
+func printJSON(v any) { b, _ := json.MarshalIndent(v, "", "  "); fmt.Println(string(b)) }
 
 var _ = url.QueryEscape

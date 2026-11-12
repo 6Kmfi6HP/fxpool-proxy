@@ -235,3 +235,132 @@ func TestUDPServerRelaysSOCKS5Frames(t *testing.T) {
 		t.Fatalf("framed reply = %q", string(buf[:n]))
 	}
 }
+
+func udpFrame(port int, payload string) []byte {
+	frame := []byte{0, 0, 0, 3, 11}
+	frame = append(frame, "dns.example"...)
+	frame = append(frame, byte(port>>8), byte(port))
+	return append(frame, payload...)
+}
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
+func TestUDPServerIdleReclaimsTunnel(t *testing.T) {
+	d := &perClientUDPDialer{}
+	srv := NewUDPServer(d, []serverlist.Node{{Protocol: "masque", Supported: true}})
+	srv.IdleTimeout = 60 * time.Millisecond
+	a, e := srv.Listen("127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer srv.Close()
+	cli, e := net.DialUDP("udp4", nil, a.(*net.UDPAddr))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer cli.Close()
+	srv.AllowClient(cli.LocalAddr())
+	if _, e = cli.Write(udpFrame(53, "idle")); e != nil {
+		t.Fatal(e)
+	}
+	if !waitFor(t, time.Second, func() bool { return srv.Stats().Tunnels == 1 }) {
+		t.Fatalf("tunnel was not created: %+v", srv.Stats())
+	}
+	if !waitFor(t, 2*time.Second, func() bool { return srv.Stats().Tunnels == 0 }) {
+		t.Fatalf("idle tunnel was not reclaimed: %+v", srv.Stats())
+	}
+	st := srv.Stats()
+	if st.IdleClosed == 0 || st.Clients != 0 {
+		t.Fatalf("unexpected stats after idle reclaim: %+v", st)
+	}
+	// The client slot must be reusable after reclamation.
+	if _, e = cli.Write(udpFrame(53, "again")); e != nil {
+		t.Fatal(e)
+	}
+	if !waitFor(t, time.Second, func() bool { return srv.Stats().Tunnels == 1 }) {
+		t.Fatalf("client could not reopen a tunnel: %+v", srv.Stats())
+	}
+}
+
+func TestUDPServerPerClientTunnelLimit(t *testing.T) {
+	d := &perClientUDPDialer{}
+	srv := NewUDPServer(d, []serverlist.Node{{Protocol: "masque", Supported: true}})
+	srv.MaxTunnelsPerClient = 1
+	a, e := srv.Listen("127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer srv.Close()
+	cli, e := net.DialUDP("udp4", nil, a.(*net.UDPAddr))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer cli.Close()
+	srv.AllowClient(cli.LocalAddr())
+
+	if _, e = cli.Write(udpFrame(53, "first")); e != nil {
+		t.Fatal(e)
+	}
+	if !waitFor(t, time.Second, func() bool { return d.count() == 1 }) {
+		t.Fatalf("first tunnel not created")
+	}
+	if _, e = cli.Write(udpFrame(54, "second")); e != nil {
+		t.Fatal(e)
+	}
+	if !waitFor(t, time.Second, func() bool { return srv.Stats().Rejected >= 1 }) {
+		t.Fatalf("second tunnel was not rejected: %+v", srv.Stats())
+	}
+	if got := d.count(); got != 1 {
+		t.Fatalf("tunnels = %d, want 1", got)
+	}
+	if got := srv.Stats().Tunnels; got != 1 {
+		t.Fatalf("stats tunnels = %d, want 1", got)
+	}
+}
+
+func TestUDPServerConcurrentSweepAndWrites(t *testing.T) {
+	d := &perClientUDPDialer{}
+	srv := NewUDPServer(d, []serverlist.Node{{Protocol: "masque", Supported: true}})
+	srv.IdleTimeout = 20 * time.Millisecond
+	srv.MaxTunnelsPerClient = 4
+	a, e := srv.Listen("127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	cli, e := net.DialUDP("udp4", nil, a.(*net.UDPAddr))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer cli.Close()
+	srv.AllowClient(cli.LocalAddr())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 200 {
+			_, _ = cli.Write(udpFrame(50+i%4, "race"))
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	for range 60 {
+		srv.sweepIdle()
+		time.Sleep(time.Millisecond)
+	}
+	<-done
+	if e := srv.Close(); e != nil {
+		t.Fatal(e)
+	}
+	if got := srv.Stats().Tunnels; got != 0 {
+		t.Fatalf("tunnels after close = %d", got)
+	}
+}
