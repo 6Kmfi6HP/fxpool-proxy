@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,8 +54,34 @@ func (c *Client) http() *http.Client {
 // such a network; a credential bundle must be imported instead.
 var ErrWAFBlocked = errors.New("FxA auth request blocked by the Fastly WAF (HTTP 406)")
 
+// Stage identifies the FxA call that failed.
+type Stage string
+
+const (
+	StageCredentialsStatus Stage = "credentials_status"
+	StageAccountLogin      Stage = "account_login"
+	StageTOTPVerify        Stage = "totp_verify"
+)
+
+// TransportError is a network-level failure (DNS, connect, TLS, timeout)
+// before an HTTP response was available. It records which stage failed.
+type TransportError struct {
+	Stage Stage
+	Err   error
+}
+
+func (e *TransportError) Error() string { return fmt.Sprintf("FxA %s: %v", e.Stage, e.Err) }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+// Timeout reports whether the underlying network error was a timeout.
+func (e *TransportError) Timeout() bool {
+	var ne net.Error
+	return errors.As(e.Err, &ne) && ne.Timeout()
+}
+
 // errnoError is a non-2xx FxA response carrying the server errno.
 type errnoError struct {
+	stage  Stage
 	status int
 	errno  int
 	msg    string
@@ -66,6 +93,13 @@ func (e *errnoError) Error() string { return e.msg }
 
 // Status returns the HTTP status code of the rejected request.
 func (e *errnoError) Status() int { return e.status }
+
+// Stage returns the FxA call that failed.
+func (e *errnoError) Stage() Stage { return e.stage }
+
+// EmptyBody reports whether the error response had no body. The Fastly WAF
+// 406 is bodyless, so this distinguishes it from a JSON errno response.
+func (e *errnoError) EmptyBody() bool { return len(bytes.TrimSpace(e.body)) == 0 }
 
 // Errno returns the FxA errno carried by the response (0 when the body is
 // empty or does not contain one).
@@ -86,7 +120,7 @@ func (e *errnoError) canonicalEmail() string {
 // postJSON sends a JSON body to Base+path and decodes the response into out
 // (if non-nil). Non-2xx responses are wrapped in *errnoError with the server
 // errno and any Retry-After.
-func (c *Client) postJSON(ctx context.Context, path string, body, out any) error {
+func (c *Client) postJSON(ctx context.Context, stage Stage, path string, body, out any) error {
 	var raw []byte
 	var err error
 	if body != nil {
@@ -111,15 +145,15 @@ func (c *Client) postJSON(ctx context.Context, path string, body, out any) error
 	req.Header.Set("User-Agent", ua)
 	resp, err := c.http().Do(req)
 	if err != nil {
-		return err
+		return &TransportError{Stage: stage, Err: err}
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return err
+		return &TransportError{Stage: stage, Err: err}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return newErrnoError(resp.StatusCode, resp.Header.Get("Retry-After"), b)
+		return newErrnoError(stage, resp.StatusCode, resp.Header.Get("Retry-After"), b)
 	}
 	if out == nil {
 		return nil
@@ -130,17 +164,20 @@ func (c *Client) postJSON(ctx context.Context, path string, body, out any) error
 	return nil
 }
 
-func newErrnoError(status int, retryAfter string, body []byte) error {
-	msg := fmt.Sprintf("FxA HTTP %d", status)
+func newErrnoError(stage Stage, status int, retryAfter string, body []byte) error {
+	msg := fmt.Sprintf("FxA %s HTTP %d", stage, status)
 	var v struct {
 		Code  int    `json:"code"`
 		Errno int    `json:"errno"`
 		Error string `json:"error"`
 	}
 	if json.Unmarshal(body, &v) == nil && v.Errno != 0 {
-		msg = fmt.Sprintf("FxA HTTP %d errno %d: %s", status, v.Errno, v.Error)
+		msg = fmt.Sprintf("FxA %s HTTP %d errno %d: %s", stage, status, v.Errno, v.Error)
 	}
-	return &errnoError{status: status, errno: v.Errno, msg: msg, retry: retryAfterDuration(retryAfter), body: append([]byte(nil), body...)}
+	if len(bytes.TrimSpace(body)) == 0 {
+		msg += " (empty body)"
+	}
+	return &errnoError{stage: stage, status: status, errno: v.Errno, msg: msg, retry: retryAfterDuration(retryAfter), body: append([]byte(nil), body...)}
 }
 
 // errnoOf returns the FxA errno from an error, or 0 when not an FxA error.

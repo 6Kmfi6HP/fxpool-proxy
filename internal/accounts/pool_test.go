@@ -2,14 +2,18 @@ package accounts
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"fxpool-proxy/internal/store"
+	"fxpool-proxy/internal/token"
 )
 
 func makeDB(t *testing.T) (*store.DB, string) {
@@ -281,4 +285,181 @@ func fakeJWT() string {
 	// A real, structurally valid JWT with exp far in the future.
 	// base64url("{"alg":"RS256"}").base64url("{"sub":"test","aud":"https://vpn.mozilla.org","exp":9999999999}").fakesig
 	return "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ0ZXN0IiwiYXVkIjoiaHR0cHM6Ly92cG4ubW96aWxsYS5vcmciLCJleHAiOjk5OTk5OTk5OTksImlhdCI6MTAwMCwibmJmIjoxMDAwfQ.fakesig"
+}
+
+// A Guardian HTTP 451 is a property of the network path, not of one credential.
+// The pool must stop after the first account instead of implicitly switching
+// accounts (relay path).
+func TestPoolStopsOnRegionUnavailable(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusUnavailableForLegalReasons)
+	}))
+	defer srv.Close()
+
+	rootA, rootB := t.TempDir(), t.TempDir()
+	m1 := token.NewManager(rootA, srv.URL)
+	m1.Client = srv.Client()
+	m1.AccessToken = "access-a"
+	m2 := token.NewManager(rootB, srv.URL)
+	m2.Client = srv.Client()
+	m2.AccessToken = "access-b"
+
+	p := &Pool{managers: []*entry{
+		{uid: "uid-a", mgr: m1},
+		{uid: "uid-b", mgr: m2},
+	}}
+	_, err := p.Ensure(context.Background(), false)
+	if err == nil {
+		t.Fatal("expected a region-unavailable error")
+	}
+	if !token.IsUnavailableInRegion(err) {
+		t.Fatalf("error lost the region marker: %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("Guardian requests = %d, want 1", got)
+	}
+	if st := token.LoadState(filepath.Join(rootB, "tokens", "refresh_state.json")); st.Result != "never" {
+		t.Fatalf("second account was touched: result = %q", st.Result)
+	}
+}
+
+func quotaJWT(t *testing.T, guardian string) string {
+	t.Helper()
+	now := time.Now().Unix()
+	claims := fmt.Sprintf(`{"sub":"u","aud":%q,"iss":%q,"iat":%d,"nbf":%d,"exp":%d}`, guardian, guardian, now, now, now+3600)
+	part := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+	return part(`{"alg":"RS256"}`) + "." + part(claims) + "." + part("sig")
+}
+
+func storeQuota(t *testing.T, db *store.DB, accountID int64, quota store.Quota) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertQuota(ctx, tx, quota); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func quotaManagers(t *testing.T, accounts []string) ([]*entry, []*atomic.Int64, []string) {
+	t.Helper()
+	var entries []*entry
+	var counts []*atomic.Int64
+	var tokens []string
+	for _, uid := range accounts {
+		var n atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n.Add(1)
+			_, _ = w.Write([]byte(`{"token":"` + quotaJWT(t, srvURL(r)) + `"}`))
+		}))
+		t.Cleanup(srv.Close)
+		m := token.NewManager(t.TempDir(), srv.URL)
+		m.Client = srv.Client()
+		m.AccessToken = "access-" + uid
+		entries = append(entries, &entry{uid: uid, mgr: m})
+		counts = append(counts, &n)
+		tokens = append(tokens, quotaJWT(t, srv.URL))
+	}
+	return entries, counts, tokens
+}
+
+// srvURL reconstructs the request's origin so the generated JWT audience and
+// issuer match the Guardian host under test.
+func srvURL(r *http.Request) string { return "https://" + r.Host }
+
+func TestQuotaPolicySkipsExhaustedAccount(t *testing.T) {
+	db, _ := makeDB(t)
+	idA := addAccount(t, db, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4", "a@x.com", "1111111111111111111111111111111111111111111111111111111111111111")
+	idB := addAccount(t, db, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5", "b@x.com", "2222222222222222222222222222222222222222222222222222222222222222")
+	limit, zero := 100, 0
+	storeQuota(t, db, idA, store.Quota{
+		AccountID: idA, LimitBytes: &limit, RemainingBytes: &zero,
+		ResetTime: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		UpdatedAt: time.Now(),
+	})
+	entries, counts, _ := quotaManagers(t, []string{"a", "b"})
+	entries[0].accountID, entries[1].accountID = idA, idB
+	p := &Pool{db: db, managers: entries, rrIndex: 0}
+	p.EnableQuotaPolicy(QuotaPolicy{MaxAge: time.Minute, Cooldown: time.Minute})
+	if _, err := p.Ensure(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if counts[0].Load() != 0 || counts[1].Load() == 0 {
+		t.Fatalf("requests a=%d b=%d, want a=0", counts[0].Load(), counts[1].Load())
+	}
+}
+
+func TestQuotaPolicyFallbackWhenAllExhausted(t *testing.T) {
+	db, _ := makeDB(t)
+	idA := addAccount(t, db, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6", "a@x.com", "1111111111111111111111111111111111111111111111111111111111111111")
+	idB := addAccount(t, db, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa7", "b@x.com", "2222222222222222222222222222222222222222222222222222222222222222")
+	limit, zero := 100, 0
+	for _, id := range []int64{idA, idB} {
+		storeQuota(t, db, id, store.Quota{AccountID: id, LimitBytes: &limit, RemainingBytes: &zero, UpdatedAt: time.Now()})
+	}
+	entries, counts, _ := quotaManagers(t, []string{"a", "b"})
+	entries[0].accountID, entries[1].accountID = idA, idB
+	p := &Pool{db: db, managers: entries}
+	p.EnableQuotaPolicy(QuotaPolicy{MaxAge: time.Minute, Cooldown: time.Minute})
+	if _, err := p.Ensure(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if counts[0].Load() == 0 {
+		t.Fatal("fallback did not resume plain round-robin")
+	}
+}
+
+func TestQuotaEligibilityRecovery(t *testing.T) {
+	db, _ := makeDB(t)
+	now := time.Now()
+	id := addAccount(t, db, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa8", "c@x.com", "1111111111111111111111111111111111111111111111111111111111111111")
+	limit, zero, above := 100, 0, 100
+	p := &Pool{db: db}
+	p.EnableQuotaPolicy(QuotaPolicy{MaxAge: 15 * time.Minute, MarginBytes: 10, Cooldown: 5 * time.Minute, Now: func() time.Time { return now }})
+
+	storeQuota(t, db, id, store.Quota{AccountID: id, LimitBytes: &limit, RemainingBytes: &zero, UpdatedAt: now})
+	if p.quotaEligible(context.Background(), id, now) {
+		t.Fatal("fresh exhausted quota counted as eligible")
+	}
+	// After the cooldown with no reset time, the account becomes eligible.
+	if !p.quotaEligible(context.Background(), id, now.Add(6*time.Minute)) {
+		t.Fatal("account did not recover after cooldown")
+	}
+	// A stale snapshot is treated as unknown and eligible.
+	if !p.quotaEligible(context.Background(), id, now.Add(16*time.Minute)) {
+		t.Fatal("stale snapshot did not fall back to eligible")
+	}
+	storeQuota(t, db, id, store.Quota{AccountID: id, LimitBytes: &limit, RemainingBytes: &above, UpdatedAt: now})
+	if !p.quotaEligible(context.Background(), id, now) {
+		t.Fatal("remaining above margin counted as exhausted")
+	}
+	if !p.quotaEligible(context.Background(), 99999, now) {
+		t.Fatal("unknown account quota counted as exhausted")
+	}
+}
+
+func TestParseQuotaReset(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, v := range []string{
+		now.Format(time.RFC3339),
+		now.Format(http.TimeFormat),
+		fmt.Sprint(now.Unix()),
+		fmt.Sprint(now.UnixMilli()),
+	} {
+		got, ok := parseQuotaReset(v)
+		if !ok || !got.Equal(now) {
+			t.Fatalf("parseQuotaReset(%q) = %v, %v", v, got, ok)
+		}
+	}
+	if _, ok := parseQuotaReset("soon"); ok {
+		t.Fatal("accepted invalid reset time")
+	}
 }

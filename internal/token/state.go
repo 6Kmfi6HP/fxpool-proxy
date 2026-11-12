@@ -35,14 +35,14 @@ func LoadState(path string) RefreshState {
 }
 func validResult(s string) bool {
 	switch s {
-	case "never", "credentials_imported", "in_progress", "fresh", "success", "busy", "backoff", "rate_limited", "oauth_rate_limited", "reauth_required", "no_entitlement", "missing_credentials", "transient_error", "protocol_error":
+	case "never", "credentials_imported", "in_progress", "fresh", "success", "busy", "backoff", "rate_limited", "oauth_rate_limited", "reauth_required", "no_entitlement", "missing_credentials", "transient_error", "protocol_error", "unavailable_in_region":
 		return true
 	}
 	return false
 }
 func failure(s string) bool {
 	switch s {
-	case "rate_limited", "oauth_rate_limited", "reauth_required", "no_entitlement", "missing_credentials", "transient_error", "protocol_error":
+	case "rate_limited", "oauth_rate_limited", "reauth_required", "no_entitlement", "missing_credentials", "transient_error", "protocol_error", "unavailable_in_region":
 		return true
 	}
 	return false

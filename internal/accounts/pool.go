@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,106 @@ type Pool struct {
 	mu       sync.Mutex
 	rrIndex  int
 	db       *store.DB
+	quota    *QuotaPolicy
+}
+
+// QuotaPolicy enables opt-in quota-aware account selection. When disabled
+// (the default), selection is plain round-robin. Unknown or stale quota
+// snapshots always count as eligible so the pool never dead-ends.
+type QuotaPolicy struct {
+	// MaxAge is how long a quota snapshot is trusted. Older snapshots are
+	// treated as unknown.
+	MaxAge time.Duration
+	// MarginBytes is the minimum remaining bytes required to use an account.
+	MarginBytes int64
+	// Cooldown is how long a known-exhausted account is skipped when the
+	// snapshot has no parseable reset time.
+	Cooldown time.Duration
+	// Now is a test seam; defaults to time.Now.
+	Now func() time.Time
+}
+
+// EnableQuotaPolicy turns on quota-aware selection with the given policy.
+func (p *Pool) EnableQuotaPolicy(q QuotaPolicy) {
+	if q.MaxAge <= 0 {
+		q.MaxAge = 15 * time.Minute
+	}
+	if q.Now == nil {
+		q.Now = time.Now
+	}
+	p.mu.Lock()
+	p.quota = &q
+	p.mu.Unlock()
+}
+
+func (p *Pool) quotaPolicy() *QuotaPolicy {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.quota
+}
+
+// quotaEligible reports whether the account may be used under the quota
+// policy. Anything unknown, unlimited, or stale is eligible.
+func (p *Pool) quotaEligible(ctx context.Context, accountID int64, now time.Time) bool {
+	pol := p.quotaPolicy()
+	if pol == nil {
+		return true
+	}
+	q, ok, err := p.db.GetQuota(ctx, accountID)
+	if err != nil || !ok {
+		return true
+	}
+	if q.Unlimited || q.LimitBytes == nil || q.RemainingBytes == nil {
+		return true
+	}
+	if now.Sub(q.UpdatedAt) > pol.MaxAge {
+		return true // stale snapshot: treat as unknown
+	}
+	if int64(*q.RemainingBytes) > pol.MarginBytes {
+		return true
+	}
+	if t, ok := parseQuotaReset(q.ResetTime); ok {
+		return !now.Before(t)
+	}
+	if pol.Cooldown <= 0 {
+		return true
+	}
+	return !now.Before(q.UpdatedAt.Add(pol.Cooldown))
+}
+
+// parseQuotaReset accepts the reset formats Guardian has used: RFC3339, HTTP
+// date, and Unix seconds or milliseconds.
+func parseQuotaReset(v string) (time.Time, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339, http.TimeFormat} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t, true
+		}
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if n > 1e12 {
+			return time.UnixMilli(n), true
+		}
+		return time.Unix(n, 0), true
+	}
+	return time.Time{}, false
+}
+
+// RefreshQuotas fetches and persists a quota snapshot for every account.
+// Errors are ignored: a failed refresh leaves the previous snapshot in place.
+func (p *Pool) RefreshQuotas(ctx context.Context) {
+	p.mu.Lock()
+	mgrs := make([]*token.Manager, len(p.managers))
+	for i, e := range p.managers {
+		mgrs[i] = e.mgr
+	}
+	p.mu.Unlock()
+	for _, m := range mgrs {
+		_, _ = m.Usage(ctx)
+	}
 }
 
 // Compile-time check that Pool satisfies the TokenSource interface used by
@@ -87,19 +188,66 @@ func (p *Pool) Ensure(ctx context.Context, force bool) (string, error) {
 	// Try each account in round-robin order.  The cursor advances on every
 	// selection including the force (auth-fallback) path, so successful
 	// tunnels alternate across accounts per plan §7 acceptance criterion.
-	errs := make([]string, 0, n)
-	for tried := 0; tried < n; tried++ {
-		p.mu.Lock()
-		idx := p.rrIndex % n
-		e := p.managers[idx]
-		p.rrIndex = (p.rrIndex + 1) % n
-		p.mu.Unlock()
+	p.mu.Lock()
+	start := 0
+	if n > 0 {
+		start = p.rrIndex % n
+	}
+	pol := p.quota
+	p.mu.Unlock()
 
-		tok, err := e.mgr.Ensure(ctx, force)
-		if err == nil {
+	// Split the round-robin order into eligible and ineligible (quota
+	// exhausted). Ineligible accounts are only tried when nothing else is
+	// available, so the pool falls back to plain round-robin instead of
+	// failing outright.
+	var eligible, ineligible []*entry
+	now := time.Now()
+	if pol != nil {
+		now = pol.Now()
+	}
+	for i := 0; i < n; i++ {
+		e := p.managers[(start+i)%n]
+		if pol == nil || p.quotaEligible(ctx, e.accountID, now) {
+			eligible = append(eligible, e)
+		} else {
+			ineligible = append(ineligible, e)
+		}
+	}
+	errs := make([]string, 0, n)
+	var regionErr error
+	try := func(order []*entry) (string, bool) {
+		for _, e := range order {
+			p.mu.Lock()
+			p.rrIndex = (p.rrIndex + 1) % n
+			p.mu.Unlock()
+			tok, err := e.mgr.Ensure(ctx, force)
+			if err == nil {
+				return tok, true
+			}
+			// A region block (Guardian HTTP 451) is a property of the network
+			// path, not of this credential. Retrying another account would be an
+			// implicit relay switch, so stop immediately with the real cause.
+			if token.IsUnavailableInRegion(err) {
+				regionErr = fmt.Errorf("account %s: %w", e.uid, err)
+				return "", false
+			}
+			errs = append(errs, fmt.Sprintf("account %s: %v", e.uid, err))
+		}
+		return "", false
+	}
+	if tok, ok := try(eligible); ok {
+		return tok, nil
+	}
+	if regionErr != nil {
+		return "", regionErr
+	}
+	if len(eligible) == 0 {
+		if tok, ok := try(ineligible); ok {
 			return tok, nil
 		}
-		errs = append(errs, fmt.Sprintf("account %s: %v", e.uid, err))
+		if regionErr != nil {
+			return "", regionErr
+		}
 	}
 	return "", fmt.Errorf("accounts: all accounts unavailable: %s", strings.Join(errs, "; "))
 }

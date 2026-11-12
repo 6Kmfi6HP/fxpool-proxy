@@ -131,7 +131,7 @@ func (c *Client) Login(ctx context.Context, email, password string) (*Session, e
 
 func (c *Client) accountStatus(ctx context.Context, email string) (authMeta, error) {
 	var resp accountStatusResponse
-	if err := c.postJSON(ctx, "/account/credentials/status", map[string]string{"email": email}, &resp); err != nil {
+	if err := c.postJSON(ctx, StageCredentialsStatus, "/account/credentials/status", map[string]string{"email": email}, &resp); err != nil {
 		return authMeta{}, c.cleanErr(err)
 	}
 	return resolveAuthMeta(resp, email)
@@ -192,7 +192,7 @@ func (c *Client) loginAttempt(ctx context.Context, email string, authPW []byte) 
 		"email":  email,
 		"authPW": hex.EncodeToString(authPW),
 	}
-	if err := c.postJSON(ctx, "/account/login", payload, &resp); err != nil {
+	if err := c.postJSON(ctx, StageAccountLogin, "/account/login", payload, &resp); err != nil {
 		return accountLoginResponse{}, err
 	}
 	resp.Email = email
@@ -203,7 +203,7 @@ func (c *Client) verifyTOTP(ctx context.Context, code, sessionToken string) erro
 	if len(code) != 6 {
 		return errors.New("TOTP code must be 6 digits")
 	}
-	return c.postJSON(ctx, "/session/verify/totp", map[string]string{
+	return c.postJSON(ctx, StageTOTPVerify, "/session/verify/totp", map[string]string{
 		"code":         code,
 		"sessionToken": sessionToken,
 	}, nil)
@@ -212,6 +212,17 @@ func (c *Client) verifyTOTP(ctx context.Context, code, sessionToken string) erro
 func validSession(resp accountLoginResponse) bool {
 	return resp.SessionToken != "" && len(resp.SessionToken) == 64 && resp.UID != ""
 }
+
+// wafError keeps the WAF diagnostic (stage, status, empty body) while still
+// matching ErrWAFBlocked via errors.Is.
+type wafError struct{ cause *errnoError }
+
+func (e *wafError) Error() string {
+	return fmt.Sprintf("%v (%s): password login is not possible from this network; create the account "+
+		"with the register machine and run: fxpool-proxy import-credentials <bundle>", ErrWAFBlocked, e.cause.stage)
+}
+
+func (e *wafError) Unwrap() []error { return []error{ErrWAFBlocked, e.cause} }
 
 // cleanErr maps FxA errno to a human-readable message.
 func (c *Client) cleanErr(err error) error {
@@ -223,8 +234,7 @@ func (c *Client) cleanErr(err error) error {
 	// bodyless 406. Check the status before the errno switch: the empty body
 	// yields errno 0, which would otherwise fall through to the generic error.
 	if e.status == 406 {
-		return fmt.Errorf("%w: password login is not possible from this network; create the account "+
-			"with the register machine and run: fxpool-proxy import-credentials <bundle>", ErrWAFBlocked)
+		return &wafError{cause: e}
 	}
 	switch e.errno {
 	case errnoUnknownAccount:

@@ -19,6 +19,13 @@ type Claims struct {
 	Issuer    string  `json:"iss"`
 }
 
+// Bounded clock tolerances. They cover small skew only; they never extend the
+// signed exp and never make a token valid past its claims.
+const (
+	jwtNotBeforeTolerance = 30 * time.Second
+	jwtIssuedAtTolerance  = 300 * time.Second
+)
+
 func DecodeAndValidateJWT(raw, guardian string, now time.Time, minTTL time.Duration) (Claims, error) {
 	parts := strings.Split(strings.TrimSpace(raw), ".")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
@@ -53,7 +60,7 @@ func DecodeAndValidateJWT(raw, guardian string, now time.Time, minTTL time.Durat
 		return c, errors.New("invalid JWT timestamps")
 	}
 	n := float64(now.Unix())
-	if c.NotBefore > n+30 || c.IssuedAt > n+300 {
+	if c.NotBefore > n+jwtNotBeforeTolerance.Seconds() || c.IssuedAt > n+jwtIssuedAtTolerance.Seconds() {
 		return c, errors.New("JWT is not yet valid")
 	}
 	if c.Expires-n < minTTL.Seconds() {

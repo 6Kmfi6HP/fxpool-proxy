@@ -58,10 +58,14 @@ type Credentials struct {
 }
 type Manager struct {
 	Root, Guardian, FxAAuth, FxAOAuth string
-	Client                            *http.Client
-	ExplicitProxyPass, AccessToken    string
-	mu                                sync.Mutex
-	refreshing                        bool
+	// Client is the Guardian transport. FxAClient is the FxA auth/OAuth
+	// transport; keeping them separate prevents FxA-specific settings from
+	// leaking into Guardian and Remote Settings calls.
+	Client                         *http.Client
+	FxAClient                      *http.Client
+	ExplicitProxyPass, AccessToken string
+	mu                             sync.Mutex
+	refreshing                     bool
 	// Store, when non-nil, makes the Manager read and write account data
 	// through the database instead of the legacy file paths. AccountID
 	// identifies the row in the accounts table. When Store is nil the
@@ -137,7 +141,7 @@ func (m *Manager) Usage(ctx context.Context) (Usage, error) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Usage{}, &httpError{status: resp.StatusCode, msg: fmt.Sprintf("Guardian HTTP %d", resp.StatusCode)}
+		return Usage{}, guardianHTTPError(resp.StatusCode, retryAfter(resp.Header.Get("Retry-After")))
 	}
 	u := Usage{}
 	if v := resp.Header.Get("X-Quota-Unlimited"); v != "" {
@@ -177,15 +181,31 @@ func NewManager(root, guardian string) *Manager {
 	if guardian == "" {
 		guardian = "https://vpn.mozilla.org"
 	}
-	return &Manager{Root: root, Guardian: strings.TrimRight(guardian, "/"), FxAAuth: "https://api.accounts.firefox.com/v1", FxAOAuth: "https://oauth.accounts.firefox.com/v1", Client: &http.Client{Timeout: 15 * time.Second}}
+	return &Manager{
+		Root:      root,
+		Guardian:  strings.TrimRight(guardian, "/"),
+		FxAAuth:   "https://api.accounts.firefox.com/v1",
+		FxAOAuth:  "https://oauth.accounts.firefox.com/v1",
+		Client:    &http.Client{Timeout: 15 * time.Second},
+		FxAClient: &http.Client{Timeout: 15 * time.Second},
+	}
 }
 
 // Login authenticates an FxA email+password, publishes the resulting renewal
 // credentials, and exchanges them for a fresh ProxyPass. On success the
 // renewal_credentials.json is written (0600) and the caller can Refresh() to
 // verify the whole chain. The password is not retained.
+// fxaHTTP returns the transport for FxA calls, falling back to Client for
+// Managers built before FxAClient existed (tests and embedders).
+func (m *Manager) fxaHTTP() *http.Client {
+	if m.FxAClient != nil {
+		return m.FxAClient
+	}
+	return m.Client
+}
+
 func (m *Manager) Login(ctx context.Context, email, password string, opts ...func(*fxa.Client)) (*fxa.Session, error) {
-	fc := &fxa.Client{Base: m.FxAAuth, HTTP: m.Client}
+	fc := &fxa.Client{Base: m.FxAAuth, HTTP: m.fxaHTTP()}
 	for _, o := range opts {
 		o(fc)
 	}
@@ -371,6 +391,9 @@ func (m *Manager) Refresh(ctx context.Context, force bool) (string, error) {
 	state := m.loadState()
 	now := time.Now()
 	if state.NextAttemptAt != nil && *state.NextAttemptAt > float64(now.Unix()) {
+		if state.Result == "unavailable_in_region" {
+			return "", &regionUnavailableError{errors.New("refresh deferred: Guardian region unavailable (HTTP 451)")}
+		}
 		return "", errors.New("refresh deferred by persisted cooldown")
 	}
 	if !force {
@@ -425,12 +448,16 @@ func (m *Manager) fail(result string, status *int, cause error) error {
 	if errors.As(cause, &he) && he.retry > 0 {
 		delay = he.retry
 	}
-	if result == "reauth_required" || result == "no_entitlement" || result == "protocol_error" {
+	if result == "reauth_required" || result == "no_entitlement" || result == "protocol_error" || result == "unavailable_in_region" {
 		delay = 5 * time.Minute
 	}
 	next := time.Now().Add(delay)
 	_, _ = m.saveState(result, time.Now(), status, &next, nil)
-	return fmt.Errorf("%s: %w", result, cause)
+	wrapped := fmt.Errorf("%s: %w", result, cause)
+	if result == "unavailable_in_region" {
+		return &regionUnavailableError{wrapped}
+	}
+	return wrapped
 }
 func (m *Manager) lock(block bool) (*os.File, error) {
 	p := filepath.Join(m.Root, "tokens", ".refresh.lock")
@@ -456,6 +483,36 @@ type httpError struct {
 }
 
 func (e *httpError) Error() string { return e.msg }
+
+// guardianHTTPError builds the Guardian HTTP error used by both the HEAD quota
+// probe and the token refresh. HTTP 451 (Unavailable For Legal Reasons) is the
+// region-block signal: it must produce an actionable diagnostic and must not
+// look like a generic transient failure.
+func guardianHTTPError(status int, retry time.Duration) *httpError {
+	if status == http.StatusUnavailableForLegalReasons {
+		return &httpError{
+			status: status,
+			retry:  retry,
+			msg:    "Guardian HTTP 451: region unavailable; this network cannot obtain a ProxyPass. Use a supported network or the official Firefox IP Protection region flow; no automatic retry or relay switch is performed.",
+		}
+	}
+	return &httpError{status: status, retry: retry, msg: fmt.Sprintf("Guardian HTTP %d", status)}
+}
+
+// regionUnavailableError marks a failure caused by Guardian HTTP 451. The
+// account pool uses it to stop trying other accounts, because a region block
+// applies to the whole network path, not to a single credential.
+type regionUnavailableError struct{ err error }
+
+func (e *regionUnavailableError) Error() string { return e.err.Error() }
+func (e *regionUnavailableError) Unwrap() error { return e.err }
+
+// IsUnavailableInRegion reports whether err was caused by a Guardian HTTP 451.
+func IsUnavailableInRegion(err error) bool {
+	var e *regionUnavailableError
+	return errors.As(err, &e)
+}
+
 func httpStatus(e error) *int {
 	var h *httpError
 	if errors.As(e, &h) {
@@ -474,6 +531,9 @@ func classify(e error) string {
 		}
 		if h.status == 403 {
 			return "no_entitlement"
+		}
+		if h.status == http.StatusUnavailableForLegalReasons {
+			return "unavailable_in_region"
 		}
 		if h.status >= 500 {
 			return "transient_error"
@@ -541,6 +601,26 @@ func hawkHeader(method string, u *url.URL, body []byte, session string) (string,
 	}
 	return h + fmt.Sprintf(`, mac="%s"`, signature), nil
 }
+
+// isFxAEndpoint reports whether endpoint belongs to the FxA auth or OAuth
+// host configured on this Manager.
+func (m *Manager) isFxAEndpoint(endpoint string) bool {
+	u, e := url.Parse(endpoint)
+	if e != nil || u.Hostname() == "" {
+		return false
+	}
+	for _, base := range []string{m.FxAAuth, m.FxAOAuth} {
+		if base == "" {
+			continue
+		}
+		b, e := url.Parse(base)
+		if e == nil && strings.EqualFold(b.Hostname(), u.Hostname()) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) jsonRequestWithHeader(ctx context.Context, method, endpoint string, body any, auth string) (map[string]any, http.Header, error) {
 	var raw []byte
 	var e error
@@ -564,7 +644,11 @@ func (m *Manager) jsonRequestWithHeader(ctx context.Context, method, endpoint st
 	if auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
-	resp, e := m.Client.Do(req)
+	client := m.Client
+	if m.FxAClient != nil && m.isFxAEndpoint(endpoint) {
+		client = m.FxAClient
+	}
+	resp, e := client.Do(req)
 	if e != nil {
 		return nil, nil, e
 	}
@@ -686,6 +770,10 @@ func (m *Manager) authorize(ctx context.Context, session string) (string, error)
 func (m *Manager) guardianToken(ctx context.Context, access string) (string, *Usage, error) {
 	v, h, e := m.jsonRequestWithHeader(ctx, "GET", m.Guardian+"/api/v1/fpn/token", nil, "Bearer "+access)
 	if e != nil {
+		var he *httpError
+		if errors.As(e, &he) && he.status == http.StatusUnavailableForLegalReasons {
+			return "", nil, guardianHTTPError(he.status, he.retry)
+		}
 		return "", nil, e
 	}
 	t, ok := v["token"].(string)

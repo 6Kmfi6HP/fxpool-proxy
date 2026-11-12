@@ -406,7 +406,7 @@ func TestLoginWAFBlocked(t *testing.T) {
 }
 
 func TestErrnoErrorAccessors(t *testing.T) {
-	waf, ok := newErrnoError(http.StatusNotAcceptable, "", nil).(*errnoError)
+	waf, ok := newErrnoError(StageAccountLogin, http.StatusNotAcceptable, "", nil).(*errnoError)
 	if !ok {
 		t.Fatal("newErrnoError did not return *errnoError")
 	}
@@ -416,8 +416,11 @@ func TestErrnoErrorAccessors(t *testing.T) {
 	if waf.Errno() != 0 {
 		t.Fatalf("Errno() = %d, want 0 for an empty body", waf.Errno())
 	}
+	if waf.Stage() != StageAccountLogin || !waf.EmptyBody() {
+		t.Fatalf("Stage() = %q, EmptyBody() = %v", waf.Stage(), waf.EmptyBody())
+	}
 
-	incorrect, ok := newErrnoError(http.StatusBadRequest, "",
+	incorrect, ok := newErrnoError(StageAccountLogin, http.StatusBadRequest, "",
 		[]byte(`{"code":400,"errno":103,"error":"Incorrect password"}`)).(*errnoError)
 	if !ok {
 		t.Fatal("newErrnoError did not return *errnoError")
@@ -428,4 +431,67 @@ func TestErrnoErrorAccessors(t *testing.T) {
 	if incorrect.Errno() != errnoIncorrectPass {
 		t.Fatalf("Errno() = %d, want %d", incorrect.Errno(), errnoIncorrectPass)
 	}
+	if incorrect.EmptyBody() {
+		t.Fatal("JSON errno response reported as empty body")
+	}
 }
+
+func TestLoginStatusStageDiagnostics(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotAcceptable)
+	})
+	_, err := c.Login(context.Background(), "u@example.org", "pw")
+	var e *errnoError
+	if !errors.As(err, &e) {
+		t.Fatalf("not an errnoError: %v", err)
+	}
+	if e.Stage() != StageCredentialsStatus || e.Status() != http.StatusNotAcceptable || !e.EmptyBody() {
+		t.Fatalf("stage=%q status=%d empty=%v", e.Stage(), e.Status(), e.EmptyBody())
+	}
+}
+
+func TestLoginStageDiagnostics(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/account/credentials/status":
+			w.Write([]byte(liveV2StatusBody))
+		case "/account/login":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"code":500,"errno":999,"error":"boom"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	_, err := c.Login(context.Background(), "u@example.org", "pw")
+	var e *errnoError
+	if !errors.As(err, &e) {
+		t.Fatalf("not an errnoError: %v", err)
+	}
+	if e.Stage() != StageAccountLogin || e.Status() != http.StatusInternalServerError || e.EmptyBody() {
+		t.Fatalf("stage=%q status=%d empty=%v", e.Stage(), e.Status(), e.EmptyBody())
+	}
+}
+
+func TestTransportErrorStage(t *testing.T) {
+	c := &Client{
+		Base: "https://fxa.invalid/v1",
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("dial refused")
+		})},
+	}
+	_, err := c.Login(context.Background(), "u@example.org", "pw")
+	var te *TransportError
+	if !errors.As(err, &te) {
+		t.Fatalf("not a TransportError: %v", err)
+	}
+	if te.Stage != StageCredentialsStatus || te.Timeout() {
+		t.Fatalf("stage=%q timeout=%v", te.Stage, te.Timeout())
+	}
+	if !strings.Contains(err.Error(), string(StageCredentialsStatus)) {
+		t.Fatalf("error omits stage: %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
