@@ -6,8 +6,9 @@
 **SOCKS5 UDP ASSOCIATE 中继**，把 UDP 流量经 **MASQUE（HTTP/3 CONNECT-UDP，
 RFC 9298）** 隧道出口。
 
-TCP 流量始终走 HTTPS CONNECT；MASQUE CONNECT-UDP 只承载 UDP（如 QUIC/HTTP3/DNS），
-由 `--masque-uri` 指向的代理端点承担。不支持 MASQUE/HTTP3 时行为与旧版一致。
+TCP 流量始终走 HTTPS CONNECT；MASQUE CONNECT-UDP 只承载 UDP（如 QUIC/HTTP3），
+由 `--masque-uri` 指向的代理端点承担。特定目标端口（包括 53/DNS）是否可达
+取决于节点实测，本项目未做保证。不支持 MASQUE/HTTP3 时行为与旧版一致。
 未知上游协议、未知过滤表达式、未鉴权的非回环监听均会 fail closed。
 与 Mozilla / Firefox / Fastly 无官方隶属关系。
 
@@ -147,7 +148,12 @@ FxA session，并可选地走一次开通，写出
 **WAF 边界**：在受 Fastly WAF 影响的网络上，`POST /v1/account/create` 与
 `POST /v1/account/login` 返回 406（空响应体），因此 `login` 与注册机的
 `--backend api` 都无法工作；`/v1/account/status`、OAuth 与 Guardian 正常。
-遇到 406 时 `fxpool-proxy` 会提示改用 `import-credentials`。
+遇到 406 时 `fxpool-proxy` 会提示改用 `import-credentials`。错误信息包含失败阶段
+（`credentials_status` / `account_login` / `totp_verify`）、HTTP 状态码、是否空响应，
+网络错误单独标记为传输阶段失败。2026-11-11 受控对照（同一 `credentials/status`
+请求）显示状态码只随 User-Agent 变化，`Accept-Encoding: identity`、`gzip` 与不发送
+该头的结果相同，因此未启用 `identity`。`clock-check` 用可信 HTTPS `Date` 观测本机
+时钟偏差；它只报告，不延长任何 JWT `exp`。
 
 **开通（entitlement）**：新账号在浏览器里走一次
 `GET https://vpn.mozilla.org/api/v1/fpn/auth` 之前，`/api/v1/fpn/status` 与
@@ -181,6 +187,33 @@ Guardian 无稳定 JWKS 合约，**不验证 JWT 签名**。
 | 每节点 HTTP | `--http-base` 起，默认 `31000+` |
 | UDP 中继（MASQUE，SOCKS5 UDP ASSOCIATE） | `--udp-base` 起，默认 `41000`（需 `--masque-uri`） |
 
+UDP 中继只转发 SOCKS5 UDP ASSOCIATE 数据报；目的端口是否可用由 MASQUE 代理策略决定，本项目不保证任何端口。2026-11-11 在授权节点
+`us.m1.fastly-masque.net:2499` 上实测（目标 `1.1.1.1`，模板
+`https://us.m1.fastly-masque.net:2499/.well-known/masque/udp/{target_host}/{target_port}/`）：
+
+| 目的端口 | CONNECT-UDP | 结果 |
+|---|---|---|
+| 80、443、3478、51820、8080、8443 | 200 | 隧道建立，未见回包（任意探测载荷） |
+| 53、123、500、1194、1900、4500 | 502 | 代理拒绝 |
+
+这是该节点当次策略，不是协议保证；其他节点、时间或目标可能不同。53 被拒绝时普通
+UDP DNS 不可用。未实现 DNS-over-HTTPS；需要可靠 DNS 时使用经 CONNECT 的 TCP DNS，
+或自行配置 DoH 客户端。用 `udp-probe` 在授权节点上复验：
+
+```bash
+./fxpool-proxy udp-probe --account-mode rr \
+  --masque-uri 'https://us.m1.fastly-masque.net:2499/.well-known/masque/udp/{target_host}/{target_port}/' \
+  --probe-target 1.1.1.1 --probe-ports 53,80,443,3478,8080,8443,51820
+```
+
+报告只含节点 hostname、目标、端口、隧道状态和脱敏错误，不含凭据。SOCKS5 UDP
+ASSOCIATE 建立后没有逐数据报错误码，代理拒绝时客户端只会看到无回包，因此失败原因
+只能通过 `udp-probe` 和中继日志诊断。
+
+每个客户端 UDP tunnel 默认最多 `--udp-max-tunnels-client=64` 个；空闲
+`--udp-idle-timeout`（默认 `2m`）后回收。两个值都可设为 `0` 关闭限制。超过上限的
+新目标数据报被丢弃并计入 `Rejected`，不会挤掉已存在的 tunnel。
+
 端口映射持久化在 `data/port-map.json`。验证：
 
 ```bash
@@ -204,6 +237,8 @@ fxpool-proxy token-refresh [--force] [--uid UID] [--all]
 fxpool-proxy usage
 fxpool-proxy how-to-token
 fxpool-proxy probe [--country US]
+fxpool-proxy udp-probe --masque-uri URI [--probe-target IP] [--probe-ports LIST]
+fxpool-proxy clock-check [--clock-url URL]
 fxpool-proxy run
 fxpool-proxy login
 fxpool-proxy export-credentials [options]
@@ -218,7 +253,9 @@ fxpool-proxy version
 | `token-status` | JSON：续期就绪、ProxyPass、刷新状态；多账号时输出所有账号列表 |
 | `token-refresh` | 刷新 ProxyPass；`--uid` 指定账号，`--all` 刷新全部 |
 | `usage` | Guardian 配额（多账号模式下查询当前选中账号） |
-| `probe` | 经一节点 CONNECT 探测 ipinfo.io |
+| `probe` | 经一节点 CONNECT 采样两个地理来源并检查 IPv4/IPv6 出口；不输出 IP，只告警国家不一致 |
+| `udp-probe` | 在授权 MASQUE 节点上逐端口测试 CONNECT-UDP；输出脱敏 JSON |
+| `clock-check` | 用可信 HTTPS `Date` 报告本机时钟偏差（秒） |
 | `login` | 邮箱+密码自动登录并发布续期凭据（仅限未被 WAF 拦截的网络） |
 | `export-credentials` | 从本机 Firefox 导出续期包 |
 | `import-credentials` | 导入注册机或 Firefox 凭据包并验证；多账号模式下按 uid upsert |
@@ -232,7 +269,15 @@ fxpool-proxy version
 `--rotator` / `--http-rotator`（`off` 关闭综合入口）、`--rotate-mode random|rr`、
 `--account-mode rr`（多账号轮询）、
 `--force-sync`、`--allow-no-token`、`--recommended`、`--auth-user` / `--auth-pass`、
-`--require-auth`、`--allow-open-proxy`、`--root`。
+`--require-auth`、`--allow-open-proxy`、
+`--idle-timeout`（默认 `10m`，`0` 关闭空闲回收）、
+`--max-conns`（每 Server 并发上限，默认 `512`，`0` 不限制）、
+`--udp-idle-timeout`（UDP tunnel 空闲回收，默认 `2m`，`0` 关闭）、
+`--udp-max-tunnels-client`（每客户端 UDP tunnel 上限，默认 `64`，`0` 不限制）、
+`--quota-aware`、`--quota-max-age`、`--quota-margin-bytes`、`--quota-cooldown`、
+`--quota-refresh-interval`、`--root`。
+超过 `--max-conns` 的连接在 accept 后立即关闭（此时尚未读取协议，
+无法返回 SOCKS5/HTTP 错误响应）。
 
 ## 环境变量
 
@@ -293,9 +338,9 @@ UDP 中继端口通过 `--udp-base` 标志设置（默认 `41000`），无对应
 - 非回环监听且无用户名密码时拒绝启动，除非 `--allow-open-proxy`
 - 用户名与密码必须成对出现
 - 上游仅接受 `protocol=connect` 且 `scheme=https`
-- SOCKS 仅 CONNECT；HTTP 为 CONNECT 或 `http://` absolute-form
+- SOCKS5 支持 CONNECT；配置 MASQUE 时另支持 UDP ASSOCIATE。HTTP 为 CONNECT 或 `http://` absolute-form
 - 本地 SOCKS 用户口令 / HTTP `Proxy-Authorization` Basic
-- 刷新失败进入 `reauth_required` / `rate_limited` / `no_entitlement` 等状态时会阻断隧道，直至恢复
+- 刷新失败进入 `reauth_required` / `rate_limited` / `no_entitlement` / `unavailable_in_region` 等状态时会阻断新隧道，直至恢复（已有有效缓存 token 不会被一次 HTTP 451 作废）
 
 ## 开发与 CI
 
@@ -354,6 +399,21 @@ GHCR 镜像，生成校验和、GitHub Release 和构建来源证明。发布失
 # 或通过环境变量
 FXPOOL_ACCOUNT_MODE=rr ./install.sh run
 ```
+
+### 配额感知选择（可选）
+
+默认仍是纯轮询，`--quota-aware` 才启用候选过滤：
+
+- 只信任 `--quota-max-age`（默认 `15m`）内的快照；过期快照按未知处理。
+- `unlimited`、额度未知、快照过期的账号保持可用。
+- 新鲜快照中 `remaining <= --quota-margin-bytes`（默认 `0`）的账号在 reset 时间前
+  跳过；reset 不可解析时使用 `--quota-cooldown`（默认 `15m`），到期后恢复候选。
+- 所有账号都被跳过时回退纯轮询，不会空转或直接失败。
+- `--quota-refresh-interval`（默认 `15m`，`0` 关闭）在后台刷新配额快照。
+
+2026-11-11 抽样 4 个真实账号，Guardian 均返回 `X-Quota-Unlimited: true`，没有
+`limit/remaining/reset` 头，因此过滤在这些账号上等于不启用；未人为耗尽额度去触发
+429。`usage --all` 只逐账号展示，**不合计**多个账号的配额。
 
 ### 管理账号
 

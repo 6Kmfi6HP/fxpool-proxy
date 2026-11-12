@@ -20,6 +20,7 @@
 3. **实测验证（已脱敏）** → [notes/verification-log.md](notes/verification-log.md)
 4. **本仓库运行方式** → 仓库根目录 [README.md](../README.md)
 5. **上游兼容细节** → [compatibility/firefox-upstream-compatibility.md](compatibility/firefox-upstream-compatibility.md)
+6. **社区客户端差距与实施计划** → [notes/community-client-gap-plan.md](notes/community-client-gap-plan.md)
 
 ## 相关项目
 

@@ -81,7 +81,7 @@ FxA session_token（本机 signedInUser.json）
 
 - JWT 只做结构/claims 校验，不做签名密码学验证。
 - Remote Settings 未做 Kinto canonical records / P-384 内容签名 / Mozilla PKI 全链验证。
-- 无 MASQUE/HTTP3/QUIC/UDP。
+- UDP 中继基于 MASQUE（HTTP/3 CONNECT-UDP）；TCP 数据面仍为 HTTPS CONNECT。
 - 端口→节点映射由 `data/port-map.json` 稳定化。
 
 ## 本地部署注意（不含敏感值）
@@ -89,6 +89,69 @@ FxA session_token（本机 signedInUser.json）
 - 凭据：`tokens/renewal_credentials.json`、`tokens/proxy_pass.jwt`（`0600`）
 - 导出：`export/pool.json`、`export/socks5.txt`、`export/http.txt` 等
 - **禁止**将 `tokens/`、带认证导出、日志中的凭据提交 git 或分享
+
+
+## 2026-11-11 UDP/MASQUE 端口实测
+
+节点：`us.m1.fastly-masque.net:2499`（Remote Settings 当前 hostname/port；Remote
+Settings 未发布 `protocols` 或模板，模板由客户端按标准路径构造）。目标：`1.1.1.1`。
+工具：`fxpool-proxy udp-probe`，每次探测 4–5s。
+
+| 目的端口 | CONNECT-UDP | 结果 |
+|---|---|---|
+| 80、443、3478、51820、8080、8443 | 200 | tunnel 建立；任意载荷未收到回包 |
+| 53、123、500、1194、1900、4500 | 502 | 代理拒绝 |
+
+53 对 `1.1.1.1`、`8.8.8.8`、`9.9.9.9` 均返回 502，排除单一目标因素。结论：
+目的端口准入由代理策略决定，客户端不硬编码白名单；SOCKS5 UDP ASSOCIATE 无逐
+数据报错误码，拒绝在客户端表现为无回包。QUIC 建连耗时约 0.4–2.0s，是否共享
+QUIC session 待基准与出口粘性测试后决定。
+
+## 2026-11-11 FxA 传输与时钟对照
+
+`POST https://api.accounts.firefox.com/v1/account/credentials/status`，固定
+`Content-Type: application/json` 与无账号探测邮箱，2×3 对照：
+
+| User-Agent | Accept-Encoding: identity | gzip | 不发送 | 状态码 |
+|---|---|---|---|---|
+| `fxpool-proxy/3.0` | 400 | 400 | 400 | 400 |
+| Firefox 157 形态 | 406 | 406 | 406 | 406 |
+
+结论：状态码由 User-Agent 决定，`Accept-Encoding` 无影响，未启用 `identity`。
+错误诊断记录阶段/状态码/是否空响应，不输出响应体。`clock-check` 经
+`https://vpn.mozilla.org` 的 `Date` 测得本机偏差 +1s（Date 分辨率 1s）。
+JWT 容差仍为 `nbf` +30s、`iat` +300s，签名 `exp` 不被延长。
+
+## 2026-11-11 多账号配额观测
+
+对 4 个已启用账号执行 `usage --refresh --json`（每次只读 Guardian HEAD）：
+
+| 字段 | 观测 |
+|---|---|
+| `unlimited` | 4/4 为 `true` |
+| `limit` / `remaining` / `reset` | 均为空 |
+
+结论：当前这些账号没有可用的配额计数头，`--quota-aware` 过滤对它们不生效；
+默认 rr 行为不变。没有人为耗尽账号额度来触发 429，因此 429 的账号级语义仍未复现。
+`usage --all` 取消合计，避免把多个账号的额度表达成一个可用总量。
+
+## 2026-11-11 出口观测与隧道复用基准
+
+`probe`（US 节点，远程 CONNECT）结果：ipinfo.io 与 ifconfig.co 均报告 `US`，
+IPv4 与 IPv6 出口均可达，无国家不匹配告警；报告不含出口 IP。
+
+DE 节点到 `ipinfo.io:80` 的临时基准（已删除临时程序，只保留汇总）：
+
+| 指标 | 结果 |
+|---|---|
+| 新建 CONNECT 建连 | 7 次，661 / 822 / 933 / 1857 / 1993 / 2223 / 2244 ms |
+| 新建隧道的出口 IP | 7 个互不相同 |
+| 同一隧道内 keep-alive 请求 | 7 次，326–349 ms |
+| 同一隧道内的出口 IP | 始终相同（1 个） |
+
+结论：共享 session 能省去重复建连，但会固定出口 IP，改变当前每条新隧道轮换出口的
+行为；H2 Extended CONNECT 支持尚未验证。因此不默认交付共享 session，若要实现必须
+opt-in 并按账号/节点隔离。
 
 ## 相关文档
 
