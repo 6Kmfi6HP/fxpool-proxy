@@ -41,7 +41,7 @@ func TestVersion(t *testing.T) {
 }
 
 func TestRunValidationBeforeIO(t *testing.T) {
-	for _, args := range [][]string{{"run", "--limit=-1"}, {"run", "--no-socks", "--no-http"}, {"run", "--countries=US", "--recommended"}, {"run", "--bind=0.0.0.0"}, {"run", "--idle-timeout=-1s"}, {"run", "--max-conns=-1"}, {"run", "--udp-idle-timeout=-1s"}, {"run", "--udp-max-tunnels-client=-1"}, {"run", "--quota-aware", "--quota-max-age=0"}, {"run", "--quota-margin-bytes=-1"}, {"run", "--quota-cooldown=-1s"}} {
+	for _, args := range [][]string{{"run", "--limit=-1"}, {"run", "--no-socks", "--no-http"}, {"run", "--countries=US", "--recommended"}, {"run", "--bind=0.0.0.0"}, {"run", "--idle-timeout=-1s"}, {"run", "--max-conns=-1"}, {"run", "--udp-idle-timeout=-1s"}, {"run", "--udp-max-tunnels-client=-1"}, {"run", "--quota-aware", "--quota-max-age=0"}, {"run", "--quota-margin-bytes=-1"}, {"run", "--quota-cooldown=-1s"}, {"run", "--upstream-transport=quic"}, {"run", "--upstream-session-idle-ttl=-1s"}, {"run", "--upstream-max-sessions=-1"}} {
 		if got := run(args); got != 2 {
 			t.Fatalf("%v returned %d", args, got)
 		}

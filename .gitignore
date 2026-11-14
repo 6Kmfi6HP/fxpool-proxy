@@ -21,6 +21,8 @@ fxpool-proxy.env
 *.pem
 *.key
 *session*
+!internal/upstream/session_pool.go
+!internal/upstream/session_pool_test.go
 *cookie*
 *storage*.json
 credentials*.json

@@ -41,9 +41,10 @@ type config struct {
 	fxaBase                                                                                                                                                                             string
 	accountMode                                                                                                                                                                         string
 	clockURL, probeTarget, probePorts                                                                                                                                                   string
+	upstreamTransport                                                                                                                                                                   string
 	socksBase, httpBase, udpBase, limit                                                                                                                                                 int
-	maxConns, udpMaxTunnelsClient                                                                                                                                                       int
-	idleTimeout, udpIdleTimeout, probeTimeout                                                                                                                                           time.Duration
+	maxConns, udpMaxTunnelsClient, upstreamMaxSessions                                                                                                                                  int
+	idleTimeout, udpIdleTimeout, probeTimeout, upstreamSessionIdleTTL                                                                                                                   time.Duration
 	quotaMaxAge, quotaCooldown, quotaRefreshInterval                                                                                                                                    time.Duration
 	quotaMargin                                                                                                                                                                         int64
 	forceSync, allowNoToken, noSocks, noHTTP, requireAuth, allowOpen, includeLocked, recommended, quotaAware                                                                            bool
@@ -113,6 +114,9 @@ func flagsFor(name string) (*flag.FlagSet, *config) {
 	f.StringVar(&c.probeTarget, "probe-target", "1.1.1.1", "UDP probe target host")
 	f.StringVar(&c.probePorts, "probe-ports", "53,80,443,3478,8080,8443,123", "comma-separated UDP ports for udp-probe")
 	f.DurationVar(&c.probeTimeout, "probe-timeout", 3*time.Second, "per-port timeout for probe/udp-probe")
+	f.StringVar(&c.upstreamTransport, "upstream-transport", env("UPSTREAM_TRANSPORT", "h1"), "opt-in TCP upstream transport: h1 (default fresh CONNECT), h2 (pooled HTTP/2), or h3 (pooled HTTP/3)")
+	f.DurationVar(&c.upstreamSessionIdleTTL, "upstream-session-idle-ttl", 5*time.Minute, "idle TTL for pooled H2/H3 upstream sessions")
+	f.IntVar(&c.upstreamMaxSessions, "upstream-max-sessions", 64, "maximum pooled H2/H3 upstream sessions")
 	return f, c
 }
 func main() { os.Exit(run(os.Args[1:])) }
@@ -985,13 +989,24 @@ func cmdProbe(c *config) int {
 		fmt.Fprintln(os.Stderr, "no nodes")
 		return 1
 	}
+	mode, e := upstream.ParseUpstreamTransport(c.upstreamTransport)
+	if e != nil {
+		safeError(e)
+		return 1
+	}
 	src, closeSrc, e := probeTokenSource(c)
 	if e != nil {
 		safeError(e)
 		return 1
 	}
 	defer closeSrc()
-	d := &upstream.Dialer{Tokens: src}
+	d := &upstream.Dialer{
+		Tokens:            src,
+		UpstreamTransport: mode,
+		SessionIdleTTL:    c.upstreamSessionIdleTTL,
+		MaxSessions:       c.upstreamMaxSessions,
+	}
+	defer func() { _ = d.Close() }()
 	return runProbe(context.Background(), d, *chosen, c.country)
 }
 
@@ -1421,7 +1436,14 @@ func cmdRun(c *config) int {
 		go refreshLoop(ctx, m)
 	}
 
-	dial := &upstream.Dialer{Tokens: tokenSource}
+	upstreamMode, _ := upstream.ParseUpstreamTransport(c.upstreamTransport)
+	dial := &upstream.Dialer{
+		Tokens:            tokenSource,
+		UpstreamTransport: upstreamMode,
+		SessionIdleTTL:    c.upstreamSessionIdleTTL,
+		MaxSessions:       c.upstreamMaxSessions,
+	}
+	defer func() { _ = dial.Close() }()
 	ports, e := pool.AssignPorts(filepath.Join(c.root, "data", "port-map.json"), nodes, c.socksBase, c.httpBase)
 	if e != nil {
 		safeError(e)
@@ -1509,6 +1531,15 @@ func cmdRun(c *config) int {
 	return 0
 }
 func validateRun(c *config) error {
+	if _, err := upstream.ParseUpstreamTransport(c.upstreamTransport); err != nil {
+		return err
+	}
+	if c.upstreamSessionIdleTTL < 0 {
+		return errors.New("--upstream-session-idle-ttl must be zero or positive")
+	}
+	if c.upstreamMaxSessions < 0 {
+		return errors.New("--upstream-max-sessions must be zero or positive")
+	}
 	if c.limit < 0 {
 		return errors.New("--limit must be a positive integer")
 	}

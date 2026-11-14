@@ -374,6 +374,19 @@ func (m *Manager) Ensure(ctx context.Context, force bool) (string, error) {
 	}
 	return m.Refresh(ctx, force)
 }
+
+// EnsureAccount returns a valid ProxyPass token along with a stable account
+// identifier for per-account upstream session isolation.
+func (m *Manager) EnsureAccount(ctx context.Context, force bool) (string, string, error) {
+	tok, err := m.Ensure(ctx, force)
+	if err != nil {
+		return "", "", err
+	}
+	if m.AccountID > 0 {
+		return tok, fmt.Sprintf("account-%d", m.AccountID), nil
+	}
+	return tok, "default", nil
+}
 func (m *Manager) Refresh(ctx context.Context, force bool) (string, error) {
 	m.mu.Lock()
 	if m.refreshing {

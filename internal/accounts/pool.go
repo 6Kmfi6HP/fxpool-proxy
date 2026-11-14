@@ -129,9 +129,12 @@ func (p *Pool) RefreshQuotas(ctx context.Context) {
 	}
 }
 
-// Compile-time check that Pool satisfies the TokenSource interface used by
-// upstream.Dialer.
-var _ upstream.TokenSource = (*Pool)(nil)
+// Compile-time check that Pool satisfies the TokenSource and
+// AccountTokenSource interfaces used by upstream.Dialer.
+var (
+	_ upstream.TokenSource        = (*Pool)(nil)
+	_ upstream.AccountTokenSource = (*Pool)(nil)
+)
 
 type entry struct {
 	accountID int64
@@ -179,11 +182,22 @@ func (p *Pool) Len() int { return len(p.managers) }
 //     exists; otherwise try to refresh it before moving to the next account.
 //   - force=true: force-refresh the currently selected account.
 func (p *Pool) Ensure(ctx context.Context, force bool) (string, error) {
+	tok, _, err := p.ensure(ctx, force)
+	return tok, err
+}
+
+// EnsureAccount returns a valid ProxyPass token along with the owning account's
+// stable UID so upstream session pools can isolate connections per account.
+func (p *Pool) EnsureAccount(ctx context.Context, force bool) (string, string, error) {
+	return p.ensure(ctx, force)
+}
+
+func (p *Pool) ensure(ctx context.Context, force bool) (string, string, error) {
 	p.mu.Lock()
 	n := len(p.managers)
 	p.mu.Unlock()
 	if n == 0 {
-		return "", errors.New("accounts: no enabled accounts in pool")
+		return "", "", errors.New("accounts: no enabled accounts in pool")
 	}
 	// Try each account in round-robin order.  The cursor advances on every
 	// selection including the force (auth-fallback) path, so successful
@@ -215,41 +229,41 @@ func (p *Pool) Ensure(ctx context.Context, force bool) (string, error) {
 	}
 	errs := make([]string, 0, n)
 	var regionErr error
-	try := func(order []*entry) (string, bool) {
+	try := func(order []*entry) (string, string, bool) {
 		for _, e := range order {
 			p.mu.Lock()
 			p.rrIndex = (p.rrIndex + 1) % n
 			p.mu.Unlock()
 			tok, err := e.mgr.Ensure(ctx, force)
 			if err == nil {
-				return tok, true
+				return tok, e.uid, true
 			}
 			// A region block (Guardian HTTP 451) is a property of the network
 			// path, not of this credential. Retrying another account would be an
 			// implicit relay switch, so stop immediately with the real cause.
 			if token.IsUnavailableInRegion(err) {
 				regionErr = fmt.Errorf("account %s: %w", e.uid, err)
-				return "", false
+				return "", "", false
 			}
 			errs = append(errs, fmt.Sprintf("account %s: %v", e.uid, err))
 		}
-		return "", false
+		return "", "", false
 	}
-	if tok, ok := try(eligible); ok {
-		return tok, nil
+	if tok, uid, ok := try(eligible); ok {
+		return tok, uid, nil
 	}
 	if regionErr != nil {
-		return "", regionErr
+		return "", "", regionErr
 	}
 	if len(eligible) == 0 {
-		if tok, ok := try(ineligible); ok {
-			return tok, nil
+		if tok, uid, ok := try(ineligible); ok {
+			return tok, uid, nil
 		}
 		if regionErr != nil {
-			return "", regionErr
+			return "", "", regionErr
 		}
 	}
-	return "", fmt.Errorf("accounts: all accounts unavailable: %s", strings.Join(errs, "; "))
+	return "", "", fmt.Errorf("accounts: all accounts unavailable: %s", strings.Join(errs, "; "))
 }
 
 // Reject marks the raw token as rejected in the owning account's rejected list.

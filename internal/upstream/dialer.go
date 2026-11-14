@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/masque-go"
@@ -41,6 +42,20 @@ type Dialer struct {
 	MasqueTLSConfig *tls.Config
 	// MasqueQUICConfig configures the QUIC connection to the MASQUE proxy.
 	MasqueQUICConfig *quic.Config
+	// UpstreamTransport selects the TCP CONNECT transport ("h1", "h2", or "h3").
+	// Empty or "h1" uses the default per-connection HTTP/1.1 CONNECT path.
+	UpstreamTransport UpstreamTransport
+	// SessionIdleTTL bounds how long an idle pooled H2/H3 session is kept
+	// before being closed (0 uses default 5m).
+	SessionIdleTTL time.Duration
+	// MaxSessions caps the number of pooled H2/H3 sessions (0 uses default 64).
+	MaxSessions int
+	// KeepAliveInterval configures periodic liveness checks on pooled H2
+	// sessions (0 uses default 30s; negative disables background ping).
+	KeepAliveInterval time.Duration
+
+	poolOnce sync.Once
+	pool     *sessionPool
 }
 type bufferedConn struct {
 	net.Conn
@@ -87,11 +102,15 @@ func (d *Dialer) Open(ctx context.Context, node serverlist.Node, targetHost stri
 	if !node.Supported || node.Protocol != "connect" {
 		return nil, errUnsupportedProtocol
 	}
-	token, e := d.Tokens.Ensure(ctx, false)
+	mode, err := d.transportMode()
+	if err != nil {
+		return nil, err
+	}
+	token, accountKey, e := d.ensureToken(ctx, false)
 	if e != nil {
 		return nil, e
 	}
-	c, status, e := d.once(ctx, node, targetHost, targetPort, token)
+	c, status, e := d.openWithMode(ctx, mode, node, accountKey, targetHost, targetPort, token)
 	if e == nil {
 		return c, nil
 	}
@@ -99,12 +118,19 @@ func (d *Dialer) Open(ctx context.Context, node serverlist.Node, targetHost stri
 		return nil, e
 	}
 	_ = d.Tokens.Reject(token)
-	token, e = d.Tokens.Ensure(ctx, true)
+	token, accountKey, e = d.ensureToken(ctx, true)
 	if e != nil {
 		return nil, e
 	}
-	c, _, e = d.once(ctx, node, targetHost, targetPort, token)
+	c, _, e = d.openWithMode(ctx, mode, node, accountKey, targetHost, targetPort, token)
 	return c, e
+}
+
+func (d *Dialer) openWithMode(ctx context.Context, mode UpstreamTransport, node serverlist.Node, accountKey, targetHost string, targetPort int, token string) (net.Conn, int, error) {
+	if mode == TransportH1 {
+		return d.once(ctx, node, targetHost, targetPort, token)
+	}
+	return d.getSessionPool().acquireAndOpen(ctx, d, mode, node, accountKey, targetHost, targetPort, token)
 }
 
 // once establishes a TCP tunnel to the selected node via HTTPS CONNECT.
@@ -236,10 +262,7 @@ func (d *Dialer) openMASQUE(ctx context.Context, node serverlist.Node, targetHos
 	}
 	quicConf := d.MasqueQUICConfig
 	if quicConf == nil {
-		quicConf = &quic.Config{
-			EnableDatagrams:   true,
-			InitialPacketSize: 1350,
-		}
+		quicConf = defaultMasqueQUICConfig()
 	} else if !quicConf.EnableDatagrams {
 		return nil, errors.New("masque: QUICConfig must enable datagrams")
 	}
@@ -263,6 +286,17 @@ func (d *Dialer) openMASQUE(ctx context.Context, node serverlist.Node, targetHos
 		return nil, fmt.Errorf("upstream MASQUE HTTP %d", resp.StatusCode)
 	}
 	return conn, nil
+}
+
+// defaultMasqueQUICConfig returns the default QUIC configuration for MASQUE
+// tunnels. InitialPacketSize is set to RFC 9000's 1200-byte minimum so initial
+// handshakes succeed over 1280-byte TUN/VPN interfaces before DPLPMTUD probes
+// larger packet sizes.
+func defaultMasqueQUICConfig() *quic.Config {
+	return &quic.Config{
+		EnableDatagrams:   true,
+		InitialPacketSize: 1200,
+	}
 }
 
 // isMASQUEAuthError reports whether err came from an HTTP 401, 403, or 407
